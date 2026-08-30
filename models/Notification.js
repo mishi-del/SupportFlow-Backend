@@ -12,24 +12,12 @@ const notificationSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Ticket',
       default: null,
+      index: true,
     },
     type: {
       type: String,
       required: true,
-      enum: [
-        'worker_applied',
-        'worker_approved',
-        'worker_rejected',
-        'ticket_created',
-        'ticket_accepted',
-        'ticket_rejected',
-        'ticket_status_updated',
-        'ticket_priority_updated',
-        'new_message',
-        'ticket_resolved',
-        'review_submitted',
-        'system',
-      ],
+      index: true,
     },
     title: {
       type: String,
@@ -55,5 +43,7 @@ const notificationSchema = new mongoose.Schema(
     timestamps: true,
   }
 );
+
+notificationSchema.index({ recipient: 1, isRead: 1, createdAt: -1 });
 
 module.exports = mongoose.model('Notification', notificationSchema);

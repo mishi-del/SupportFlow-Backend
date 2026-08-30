@@ -18,6 +18,7 @@ const protect = async (req, res, next) => {
     return res.status(401).json({
       success: false,
       message: 'Access denied. No authentication token provided.',
+      code: 'UNAUTHORIZED',
     });
   }
 
@@ -32,33 +33,37 @@ const protect = async (req, res, next) => {
     if (!user) {
       return res.status(401).json({
         success: false,
-        message: 'The account associated with this token no longer exists.',
+        message: 'The account associated with this session no longer exists.',
+        code: 'USER_NOT_FOUND',
       });
     }
 
-    // If user is a worker, enforce approval status check
+    if (!user.isActive) {
+      return res.status(403).json({
+        success: false,
+        message: 'Your account has been deactivated. Please contact an administrator.',
+        code: 'ACCOUNT_DEACTIVATED',
+      });
+    }
+
+    // Worker Approval Status Verification
     if (user.role === 'worker') {
       if (user.workerApprovalStatus === 'pending') {
         return res.status(403).json({
           success: false,
           message:
             'Your Worker application is currently Pending Approval by an Administrator.',
+          code: 'WORKER_PENDING_APPROVAL',
         });
       }
       if (user.workerApprovalStatus === 'rejected') {
         return res.status(403).json({
           success: false,
           message:
-            'Your Worker application was not approved. Worker access is disabled.',
+            'Your Worker application was rejected by the administrator. Access is disabled.',
+          code: 'WORKER_APPLICATION_REJECTED',
         });
       }
-    }
-
-    if (!user.isActive) {
-      return res.status(403).json({
-        success: false,
-        message: 'Your account has been deactivated. Please contact support.',
-      });
     }
 
     req.user = user;
@@ -66,13 +71,14 @@ const protect = async (req, res, next) => {
   } catch (err) {
     return res.status(401).json({
       success: false,
-      message: 'Invalid or expired token. Please log in again.',
+      message: 'Invalid or expired authorization token. Please sign in again.',
+      code: 'TOKEN_INVALID',
     });
   }
 };
 
 /**
- * Authorize specific user roles
+ * Authorize specific user roles (RBAC)
  * @param  {...string} roles
  */
 const authorize = (...roles) => {
@@ -80,11 +86,20 @@ const authorize = (...roles) => {
     if (!req.user || !roles.includes(req.user.role)) {
       return res.status(403).json({
         success: false,
-        message: `Forbidden: User role '${req.user ? req.user.role : 'unauthenticated'}' is not authorized to access this resource.`,
+        message: `Forbidden: Role '${req.user ? req.user.role : 'unauthenticated'}' is not authorized to access this resource.`,
+        code: 'FORBIDDEN',
       });
     }
     next();
   };
 };
 
-module.exports = { protect, authorize };
+const requireWorker = (req, res, next) => {
+  return authorize('worker', 'admin')(req, res, next);
+};
+
+const requireAdmin = (req, res, next) => {
+  return authorize('admin')(req, res, next);
+};
+
+module.exports = { protect, authorize, requireWorker, requireAdmin };

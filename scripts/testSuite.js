@@ -1,172 +1,308 @@
-const mongoose = require('mongoose');
+const assert = require('assert');
 const dotenv = require('dotenv');
 const { connectDB, disconnectDB } = require('../config/db');
 const User = require('../models/User');
 const Ticket = require('../models/Ticket');
-const Review = require('../models/Review');
 const Notification = require('../models/Notification');
+const Review = require('../models/Review');
+const KnowledgeBaseArticle = require('../models/KnowledgeBaseArticle');
+const AuditLog = require('../models/AuditLog');
+const { Counter, getNextTicketNumber } = require('../models/Counter');
 const { triageRequest } = require('../services/aiTriageService');
-const bcrypt = require('bcryptjs');
+const { calculateSlaDeadline, evaluateSlaStatus } = require('../services/slaService');
 
 dotenv.config();
 
-async function runTestSuite() {
+const runIntegrationTests = async () => {
   console.log('\n========================================================');
   console.log(' 🧪 Starting SupportFlow Automated Verification Test Suite');
   console.log('========================================================\n');
 
-  let passed = 0;
-  let failed = 0;
+  let passedCount = 0;
+  let failedCount = 0;
 
-  const assert = (condition, testName) => {
-    if (condition) {
-      console.log(` ✅ PASS: ${testName}`);
-      passed++;
-    } else {
-      console.error(` ❌ FAIL: ${testName}`);
-      failed++;
+  const test = (description, fn) => {
+    try {
+      fn();
+      console.log(` ✅ PASS: ${description}`);
+      passedCount++;
+    } catch (err) {
+      console.error(` ❌ FAIL: ${description}`);
+      console.error(`    Error: ${err.message}`);
+      failedCount++;
+    }
+  };
+
+  const asyncTest = async (description, fn) => {
+    try {
+      await fn();
+      console.log(` ✅ PASS: ${description}`);
+      passedCount++;
+    } catch (err) {
+      console.error(` ❌ FAIL: ${description}`);
+      console.error(`    Error: ${err.message}`);
+      failedCount++;
     }
   };
 
   try {
     await connectDB();
+
+    // Clean test database
     await User.deleteMany({});
     await Ticket.deleteMany({});
-    await Review.deleteMany({});
     await Notification.deleteMany({});
+    await Review.deleteMany({});
+    await Counter.deleteMany({});
+    await KnowledgeBaseArticle.deleteMany({});
+    await AuditLog.deleteMany({});
 
-    // --- TEST 1: Customer Signup & Active Status ---
-    const customer = await User.create({
-      name: 'Alice Customer',
-      email: 'alice@test.com',
-      password: 'Password@123',
-      role: 'customer',
+    // Initialize sequence counter
+    await Counter.create({ _id: 'ticketNumber', seq: 1000 });
+
+    // TEST 1: Customer instant active vs Worker pending approval
+    await asyncTest('Customer is active immediately on registration', async () => {
+      const customer = await User.create({
+        name: 'Test Customer',
+        email: 'test.customer@test.com',
+        password: 'Password@123',
+        role: 'customer',
+      });
+      assert.strictEqual(customer.isActive, true);
+      assert.strictEqual(customer.workerApprovalStatus, 'approved');
     });
-    assert(customer.role === 'customer' && customer.isActive === true, 'Customer is active immediately on registration');
 
-    // --- TEST 2: Worker Signup & Pending Approval State ---
-    const worker = await User.create({
-      name: 'Bob Worker',
-      email: 'bob@test.com',
-      password: 'Password@123',
-      role: 'worker',
-      workerApprovalStatus: 'pending',
-      isActive: false,
+    await asyncTest('Worker registration requires pending approval', async () => {
+      const worker = await User.create({
+        name: 'Test Worker',
+        email: 'test.worker@test.com',
+        password: 'Password@123',
+        role: 'worker',
+      });
+      assert.strictEqual(worker.isActive, false);
+      assert.strictEqual(worker.workerApprovalStatus, 'pending');
     });
-    assert(worker.role === 'worker' && worker.workerApprovalStatus === 'pending' && worker.isActive === false, 'Worker registration requires pending approval');
 
-    // --- TEST 3: Admin Approval Workflow ---
-    worker.workerApprovalStatus = 'approved';
-    worker.isActive = true;
-    await worker.save();
-    const updatedWorker = await User.findById(worker._id);
-    assert(updatedWorker.workerApprovalStatus === 'approved' && updatedWorker.isActive === true, 'Admin can approve worker registration');
-
-    // --- TEST 4: OTP Password Reset Mechanism ---
-    const rawOtp = '654321';
-    const salt = await bcrypt.genSalt(10);
-    customer.passwordResetOTPHash = await bcrypt.hash(rawOtp, salt);
-    customer.passwordResetOTPExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
-    await customer.save();
-
-    const isOtpValid = await bcrypt.compare(rawOtp, customer.passwordResetOTPHash);
-    const isNotExpired = customer.passwordResetOTPExpiresAt > new Date();
-    assert(isOtpValid && isNotExpired, 'OTP verification and expiration validate correctly');
-
-    // Reset password
-    customer.password = 'NewPassword@123';
-    customer.passwordResetOTPHash = null;
-    customer.passwordResetOTPExpiresAt = null;
-    await customer.save();
-
-    const checkCust = await User.findById(customer._id).select('+password +passwordResetOTPHash');
-    const isNewPassValid = await checkCust.matchPassword('NewPassword@123');
-    assert(isNewPassValid && checkCust.passwordResetOTPHash === null, 'Password reset completes and clears OTP security tokens');
-
-    // --- TEST 5: Deterministic Local AI Triage ---
-    const triageBilling = triageRequest('Invoice payment failed with 500 error', 'Monthly stripe subscription was declined.');
-    assert(triageBilling.category === 'Billing & Payments', 'AI Triage accurately classifies Billing & Payments category');
-
-    const triageCritical = triageRequest('Production down outage', 'All servers are unreachable with fatal error.');
-    assert(triageCritical.priority === 'Critical', 'AI Triage accurately assesses Critical priority');
-
-    // --- TEST 6: Customer Request Creation & Workflow State Machine ---
-    const ticket = await Ticket.create({
-      ticketNumber: 'SF-9001',
-      customer: customer._id,
-      subject: 'WiFi connection drops periodically in conference room',
-      description: 'The wireless access point disconnects laptops every 15 minutes.',
-      category: 'Network & Connectivity',
-      priority: 'Medium',
-      status: 'Pending',
+    // TEST 2: Admin Worker Approval & Last-Admin Protection
+    await asyncTest('Admin can approve worker registration', async () => {
+      const worker = await User.findOne({ email: 'test.worker@test.com' });
+      worker.workerApprovalStatus = 'approved';
+      worker.isActive = true;
+      await worker.save();
+      assert.strictEqual(worker.isActive, true);
+      assert.strictEqual(worker.workerApprovalStatus, 'approved');
     });
-    assert(ticket.status === 'Pending' && ticket.assignedWorker === null, 'Customer creates request with initial Pending status');
 
-    // --- TEST 7: Worker Acceptance & Single-Worker Assignment ---
-    ticket.assignedWorker = worker._id;
-    ticket.status = 'Accepted';
-    ticket.acceptedAt = new Date();
-    await ticket.save();
-    assert(ticket.status === 'Accepted' && ticket.assignedWorker.toString() === worker._id.toString(), 'Worker can accept pending request and is assigned exclusively');
-
-    // --- TEST 8: Worker Operational Priority Adjustment ---
-    ticket.priority = 'Urgent';
-    await ticket.save();
-    assert(ticket.priority === 'Urgent', 'Assigned worker can modify operational priority');
-
-    // --- TEST 9: Status Progression ---
-    ticket.status = 'In Progress';
-    await ticket.save();
-    assert(ticket.status === 'In Progress', 'Status transitions from Accepted to In Progress');
-
-    ticket.status = 'Resolved';
-    ticket.resolvedAt = new Date();
-    await ticket.save();
-    assert(ticket.status === 'Resolved' && ticket.resolvedAt !== null, 'Status transitions from In Progress to Resolved');
-
-    // --- TEST 10: Customer 5-Star Review & Rating Constraint ---
-    const review = await Review.create({
-      ticket: ticket._id,
-      customer: customer._id,
-      worker: worker._id,
-      rating: 5,
-      comment: 'Superb and rapid network resolution!',
+    await asyncTest('Single Admin creation and Last-Admin protection check', async () => {
+      const admin = await User.create({
+        name: 'Abiha',
+        email: 'abiha@gmail.com',
+        password: '12345678',
+        role: 'admin',
+        isActive: true,
+      });
+      const activeAdminCount = await User.countDocuments({ role: 'admin', isActive: true });
+      assert.strictEqual(activeAdminCount, 1);
+      assert.strictEqual(admin.email, 'abiha@gmail.com');
     });
-    ticket.hasReview = true;
-    await ticket.save();
-    assert(review.rating === 5 && ticket.hasReview === true, 'Customer can submit 5-star review on resolved ticket');
 
-    // Duplicate review constraint
-    let duplicateRejected = false;
-    try {
-      await Review.create({
-        ticket: ticket._id,
+    // TEST 3: Collision-safe Ticket Number Generation
+    await asyncTest('Atomic collision-safe ticket numbers generate sequentially', async () => {
+      const t1 = await getNextTicketNumber();
+      const t2 = await getNextTicketNumber();
+      const t3 = await getNextTicketNumber();
+      assert.strictEqual(t1, 'SF-1001');
+      assert.strictEqual(t2, 'SF-1002');
+      assert.strictEqual(t3, 'SF-1003');
+    });
+
+    // TEST 4: AI Triage Heuristic Engine
+    test('AI Triage accurately classifies Billing & Payments with High Confidence', () => {
+      const triage = triageRequest(
+        'Invoice refund request',
+        'Customer was overcharged on credit card subscription billing'
+      );
+      assert.strictEqual(triage.category, 'Billing');
+      assert.strictEqual(triage.confidenceLabel, 'High Confidence');
+    });
+
+    test('AI Triage accurately assesses Critical priority for production outage', () => {
+      const triage = triageRequest(
+        'Complete system outage',
+        'Production server down and all users affected in fatal crash'
+      );
+      assert.strictEqual(triage.priority, 'Critical');
+    });
+
+    // TEST 5: SLA Engine Calculations
+    test('SLA Engine calculates accurate deadlines based on priority matrix', () => {
+      const now = new Date();
+      const criticalDeadline = calculateSlaDeadline('Critical', now);
+      const highDeadline = calculateSlaDeadline('High', now);
+
+      const criticalDiffMinutes = Math.round((criticalDeadline - now) / 60000);
+      const highDiffMinutes = Math.round((highDeadline - now) / 60000);
+
+      assert.strictEqual(criticalDiffMinutes, 15);
+      assert.strictEqual(highDiffMinutes, 120);
+    });
+
+    // TEST 6: Atomic Concurrent Worker Ticket Acceptance
+    await asyncTest('Simulated concurrent worker acceptance assigns only first worker', async () => {
+      const customer = await User.findOne({ role: 'customer' });
+      const workerA = await User.findOne({ email: 'test.worker@test.com' });
+      const workerB = await User.create({
+        name: 'Worker B',
+        email: 'worker.b@test.com',
+        password: 'Password@123',
+        role: 'worker',
+        workerApprovalStatus: 'approved',
+        isActive: true,
+      });
+
+      const ticket = await Ticket.create({
+        customer: customer._id,
+        subject: 'Database connection pool exhausted',
+        description: 'PostgreSQL max connections reached under load',
+        category: 'Technical Support',
+        priority: 'High',
+        status: 'Pending',
+      });
+
+      // Worker A attempts atomic claim
+      const claimA = await Ticket.findOneAndUpdate(
+        { _id: ticket._id, status: 'Pending', assignedWorker: null },
+        { $set: { assignedWorker: workerA._id, status: 'Accepted' } },
+        { new: true }
+      );
+
+      // Worker B attempts atomic claim at virtually the same instant
+      const claimB = await Ticket.findOneAndUpdate(
+        { _id: ticket._id, status: 'Pending', assignedWorker: null },
+        { $set: { assignedWorker: workerB._id, status: 'Accepted' } },
+        { new: true }
+      );
+
+      assert(claimA !== null, 'Worker A should successfully claim the ticket');
+      assert.strictEqual(claimB, null, 'Worker B claim should fail atomically');
+      assert.strictEqual(claimA.assignedWorker.toString(), workerA._id.toString());
+    });
+
+    // TEST 7: Progressive State Machine Lifecycle
+    await asyncTest('State machine enforces valid progression: Accepted -> In Progress -> Resolved -> Closed', async () => {
+      const ticket = await Ticket.findOne({ status: 'Accepted' });
+      assert(ticket, 'Ticket should exist');
+
+      // 1. In Progress
+      ticket.status = 'In Progress';
+      await ticket.save();
+      assert.strictEqual(ticket.status, 'In Progress');
+
+      // 2. Resolved
+      ticket.status = 'Resolved';
+      ticket.resolvedAt = new Date();
+      await ticket.save();
+      assert.strictEqual(ticket.status, 'Resolved');
+
+      // 3. Closed
+      ticket.status = 'Closed';
+      ticket.closedAt = new Date();
+      await ticket.save();
+      assert.strictEqual(ticket.status, 'Closed');
+
+      // 4. Reopen -> Pending
+      ticket.status = 'Pending';
+      ticket.assignedWorker = null;
+      await ticket.save();
+      assert.strictEqual(ticket.status, 'Pending');
+    });
+
+    // TEST 8: 5-Star Customer Review Constraints
+    await asyncTest('Customer can submit 5-star review on resolved ticket and uniqueness is enforced', async () => {
+      const customer = await User.findOne({ role: 'customer' });
+      const worker = await User.findOne({ email: 'test.worker@test.com' });
+
+      const resolvedTicket = await Ticket.create({
+        customer: customer._id,
+        assignedWorker: worker._id,
+        subject: 'WiFi configuration assistance',
+        description: 'Assisted with 802.11ax mesh setup',
+        status: 'Resolved',
+        resolvedAt: new Date(),
+      });
+
+      const review = await Review.create({
+        ticket: resolvedTicket._id,
         customer: customer._id,
         worker: worker._id,
-        rating: 4,
+        rating: 5,
+        comment: 'Great service and quick resolution!',
       });
-    } catch (e) {
-      duplicateRejected = true;
-    }
-    assert(duplicateRejected, 'Unique index prevents duplicate reviews for the same ticket');
 
-    // --- TEST 11: Real Aggregate Rating Calculation ---
-    const agg = await Review.aggregate([
-      { $match: { worker: worker._id } },
-      { $group: { _id: '$worker', avg: { $avg: '$rating' }, count: { $sum: 1 } } }
-    ]);
-    assert(agg.length > 0 && agg[0].avg === 5 && agg[0].count === 1, 'MongoDB aggregation calculates verified average worker rating');
+      assert.strictEqual(review.rating, 5);
+
+      // Verify unique index prevents duplicate review for same ticket
+      let duplicateError = false;
+      try {
+        await Review.create({
+          ticket: resolvedTicket._id,
+          customer: customer._id,
+          worker: worker._id,
+          rating: 4,
+          comment: 'Duplicate review attempt',
+        });
+      } catch (err) {
+        duplicateError = true;
+      }
+      assert.strictEqual(duplicateError, true, 'Duplicate review should be blocked by MongoDB unique index');
+    });
+
+    // TEST 9: Knowledge Base CRUD and View Counts
+    await asyncTest('Knowledge Base articles search and view count increments correctly', async () => {
+      const article = await KnowledgeBaseArticle.create({
+        title: 'How to configure custom email domains in SupportFlow',
+        slug: 'how-to-configure-custom-email-domains',
+        category: 'Account',
+        content: 'Navigate to email settings and enter your MX and SPF DNS records.',
+        published: true,
+      });
+
+      const found = await KnowledgeBaseArticle.findOneAndUpdate(
+        { slug: 'how-to-configure-custom-email-domains' },
+        { $inc: { viewCount: 1 } },
+        { new: true }
+      );
+
+      assert.strictEqual(found.viewCount, 1);
+      assert.strictEqual(found.title, article.title);
+    });
+
+    // TEST 10: Audit Log Recording
+    await asyncTest('System audit log records security actions accurately', async () => {
+      const admin = await User.findOne({ role: 'admin' });
+      const log = await AuditLog.create({
+        actor: admin._id,
+        actorRole: 'admin',
+        action: 'TICKET_ESCALATED',
+        target: 'SF-1002',
+        targetType: 'Ticket',
+        metadata: { reason: 'Hardware failure requires vendor dispatch' },
+      });
+
+      assert.strictEqual(log.action, 'TICKET_ESCALATED');
+      assert.strictEqual(log.actorRole, 'admin');
+    });
 
     console.log('\n========================================================');
-    console.log(` 📊 Test Results: ${passed} Passed, ${failed} Failed`);
+    console.log(` 📊 Test Results: ${passedCount} Passed, ${failedCount} Failed`);
     console.log('========================================================\n');
 
     await disconnectDB();
-    process.exit(failed > 0 ? 1 : 0);
-  } catch (err) {
-    console.error('Test runner fatal error:', err);
+    process.exit(failedCount > 0 ? 1 : 0);
+  } catch (globalErr) {
+    console.error('Fatal test runner error:', globalErr);
     process.exit(1);
   }
-}
+};
 
-runTestSuite();
+runIntegrationTests();

@@ -3,7 +3,8 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const { sendOTPEmail } = require('../services/emailService');
-const { createAndSendNotification, broadcastSocketEvent } = require('../services/notificationService');
+const { createAndSendNotification } = require('../services/notificationService');
+const { logAuditEvent } = require('../services/auditService');
 
 // Helper to generate JWT
 const generateToken = (id) => {
@@ -11,15 +12,6 @@ const generateToken = (id) => {
     { id },
     process.env.JWT_SECRET || 'supportflow_jwt_super_secret_key_2026_secure',
     { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
-  );
-};
-
-// Helper to generate temporary reset token
-const generateResetToken = (id) => {
-  return jwt.sign(
-    { id, purpose: 'password_reset' },
-    process.env.JWT_SECRET || 'supportflow_jwt_super_secret_key_2026_secure',
-    { expiresIn: '15m' }
   );
 };
 
@@ -36,7 +28,15 @@ exports.signup = async (req, res, next) => {
       return res.status(400).json({
         success: false,
         message: 'Name, email, and password are required',
-        errors: ['Please provide all required fields'],
+        code: 'MISSING_FIELDS',
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 6 characters long',
+        code: 'PASSWORD_TOO_SHORT',
       });
     }
 
@@ -44,21 +44,22 @@ exports.signup = async (req, res, next) => {
       return res.status(400).json({
         success: false,
         message: 'Passwords do not match',
-        errors: ['Passwords do not match'],
+        code: 'PASSWORD_MISMATCH',
       });
     }
 
+    // Role enforcement: Public signup can ONLY create 'customer' or 'worker'
     const validRoles = ['customer', 'worker'];
-    const chosenRole = validRoles.includes(role.toLowerCase())
-      ? role.toLowerCase()
-      : 'customer';
+    const normalizedRole = role.toLowerCase().trim();
+    const chosenRole = validRoles.includes(normalizedRole) ? normalizedRole : 'customer';
 
-    const existingUser = await User.findOne({ email: email.toLowerCase().trim() });
+    const normalizedEmail = email.toLowerCase().trim();
+    const existingUser = await User.findOne({ email: normalizedEmail });
     if (existingUser) {
       return res.status(400).json({
         success: false,
-        message: 'An account with this email already exists',
-        errors: ['Email is already registered'],
+        message: 'An account with this email address already exists',
+        code: 'EMAIL_ALREADY_REGISTERED',
       });
     }
 
@@ -66,7 +67,7 @@ exports.signup = async (req, res, next) => {
 
     const user = await User.create({
       name: name.trim(),
-      email: email.toLowerCase().trim(),
+      email: normalizedEmail,
       password,
       role: chosenRole,
       workerApprovalStatus: isWorker ? 'pending' : 'approved',
@@ -81,14 +82,18 @@ exports.signup = async (req, res, next) => {
           recipient: admin._id,
           type: 'worker_applied',
           title: 'New Worker Application',
-          message: `${user.name} (${user.email}) registered as a Worker and is pending approval.`,
+          message: `${user.name} (${user.email}) submitted a Worker application awaiting review.`,
           link: '/admin/workers',
         });
       }
-      broadcastSocketEvent('worker-application-created', {
-        workerId: user._id,
-        name: user.name,
-        email: user.email,
+
+      await logAuditEvent({
+        actor: user._id,
+        actorRole: 'worker',
+        action: 'WORKER_REGISTERED_PENDING_APPROVAL',
+        target: user._id.toString(),
+        targetType: 'User',
+        req,
       });
 
       return res.status(201).json({
@@ -108,6 +113,15 @@ exports.signup = async (req, res, next) => {
 
     // Customer registration - immediate login token
     const token = generateToken(user._id);
+
+    await logAuditEvent({
+      actor: user._id,
+      actorRole: 'customer',
+      action: 'CUSTOMER_REGISTERED',
+      target: user._id.toString(),
+      targetType: 'User',
+      req,
+    });
 
     res.status(201).json({
       success: true,
@@ -140,19 +154,18 @@ exports.login = async (req, res, next) => {
       return res.status(400).json({
         success: false,
         message: 'Please provide both email and password',
-        errors: ['Email and password are required'],
+        code: 'MISSING_CREDENTIALS',
       });
     }
 
-    const user = await User.findOne({
-      email: email.toLowerCase().trim(),
-    }).select('+password');
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await User.findOne({ email: normalizedEmail }).select('+password');
 
     if (!user) {
       return res.status(401).json({
         success: false,
-        message: 'Invalid credentials. Check email and password.',
-        errors: ['Invalid email or password'],
+        message: 'Invalid email or password',
+        code: 'INVALID_CREDENTIALS',
       });
     }
 
@@ -160,8 +173,8 @@ exports.login = async (req, res, next) => {
     if (!isMatch) {
       return res.status(401).json({
         success: false,
-        message: 'Invalid credentials. Check email and password.',
-        errors: ['Invalid email or password'],
+        message: 'Invalid email or password',
+        code: 'INVALID_CREDENTIALS',
       });
     }
 
@@ -172,7 +185,7 @@ exports.login = async (req, res, next) => {
           success: false,
           message:
             'Your Worker application is currently Pending Approval by an Administrator.',
-          errors: ['Worker account pending administrator approval'],
+          code: 'WORKER_PENDING_APPROVAL',
         });
       }
 
@@ -181,7 +194,7 @@ exports.login = async (req, res, next) => {
           success: false,
           message:
             'Your Worker application was rejected by the administrator. Access is disabled.',
-          errors: ['Worker application was rejected'],
+          code: 'WORKER_APPLICATION_REJECTED',
         });
       }
     }
@@ -190,11 +203,20 @@ exports.login = async (req, res, next) => {
       return res.status(403).json({
         success: false,
         message: 'Your account has been deactivated. Please contact support.',
-        errors: ['Account is inactive'],
+        code: 'ACCOUNT_INACTIVE',
       });
     }
 
     const token = generateToken(user._id);
+
+    await logAuditEvent({
+      actor: user._id,
+      actorRole: user.role,
+      action: 'USER_LOGIN',
+      target: user._id.toString(),
+      targetType: 'User',
+      req,
+    });
 
     res.status(200).json({
       success: true,
@@ -222,6 +244,14 @@ exports.login = async (req, res, next) => {
 exports.getMe = async (req, res, next) => {
   try {
     const user = await User.findById(req.user._id);
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User profile not found',
+        code: 'USER_NOT_FOUND',
+      });
+    }
+
     res.status(200).json({
       success: true,
       user: {
@@ -240,7 +270,7 @@ exports.getMe = async (req, res, next) => {
 };
 
 /**
- * @desc    Request Password Reset OTP
+ * @desc    Request Password Reset OTP (Cryptographically Secure)
  * @route   POST /api/auth/forgot-password
  * @access  Public
  */
@@ -252,13 +282,14 @@ exports.forgotPassword = async (req, res, next) => {
       return res.status(400).json({
         success: false,
         message: 'Email address is required',
-        errors: ['Email is required'],
+        code: 'EMAIL_REQUIRED',
       });
     }
 
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await User.findOne({ email: normalizedEmail });
 
-    // Always respond with success to avoid account enumeration
+    // Always respond with a generic success message to prevent user enumeration
     if (!user) {
       return res.status(200).json({
         success: true,
@@ -267,23 +298,36 @@ exports.forgotPassword = async (req, res, next) => {
       });
     }
 
-    // Generate secure 6-digit OTP
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    // Generate cryptographically secure 6-digit OTP using crypto.randomInt
+    const otpNumber = crypto.randomInt(100000, 1000000);
+    const otp = otpNumber.toString();
 
-    // Hash OTP with bcrypt
+    // Hash OTP with bcrypt before storing
     const salt = await bcrypt.genSalt(10);
     user.passwordResetOTPHash = await bcrypt.hash(otp, salt);
     user.passwordResetOTPExpiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 mins
+    user.passwordResetAttempts = 0; // Reset verification attempt counter
+    user.passwordResetTokenHash = null;
+    user.passwordResetTokenExpiresAt = null;
     await user.save({ validateBeforeSave: false });
 
-    // Send email / log OTP
+    // Send email / log OTP in non-prod
     await sendOTPEmail(user.email, otp, user.name);
+
+    await logAuditEvent({
+      actor: user._id,
+      actorRole: user.role,
+      action: 'PASSWORD_RESET_OTP_REQUESTED',
+      target: user._id.toString(),
+      targetType: 'User',
+      req,
+    });
 
     res.status(200).json({
       success: true,
       message:
         'If an account exists with this email, a 6-digit verification code has been dispatched.',
-      // In development/test mode, provide preview for easy testing
+      // In development/test mode only: provide preview for testing
       ...(process.env.NODE_ENV !== 'production' && { devOtpPreview: otp }),
     });
   } catch (err) {
@@ -292,7 +336,7 @@ exports.forgotPassword = async (req, res, next) => {
 };
 
 /**
- * @desc    Verify OTP code
+ * @desc    Verify OTP code & issue one-time reset token
  * @route   POST /api/auth/verify-otp
  * @access  Public
  */
@@ -303,49 +347,85 @@ exports.verifyOTP = async (req, res, next) => {
     if (!email || !otp) {
       return res.status(400).json({
         success: false,
-        message: 'Email and OTP verification code are required',
-        errors: ['Please provide email and 6-digit OTP code'],
+        message: 'Email and 6-digit OTP code are required',
+        code: 'MISSING_CREDENTIALS',
       });
     }
 
-    const user = await User.findOne({
-      email: email.toLowerCase().trim(),
-    }).select('+passwordResetOTPHash');
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await User.findOne({ email: normalizedEmail }).select(
+      '+passwordResetOTPHash +passwordResetAttempts'
+    );
 
     if (!user || !user.passwordResetOTPHash || !user.passwordResetOTPExpiresAt) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid or expired OTP code. Please request a new code.',
-        errors: ['Invalid or expired verification request'],
+        message: 'Invalid or expired verification request. Please request a new code.',
+        code: 'INVALID_RESET_REQUEST',
       });
     }
 
     // Check expiration
     if (new Date() > user.passwordResetOTPExpiresAt) {
+      user.passwordResetOTPHash = null;
+      user.passwordResetOTPExpiresAt = null;
+      await user.save({ validateBeforeSave: false });
       return res.status(400).json({
         success: false,
         message: 'Verification code has expired. Please request a new code.',
-        errors: ['OTP expired'],
+        code: 'OTP_EXPIRED',
+      });
+    }
+
+    // Check maximum attempts (max 5)
+    if (user.passwordResetAttempts >= 5) {
+      user.passwordResetOTPHash = null;
+      user.passwordResetOTPExpiresAt = null;
+      await user.save({ validateBeforeSave: false });
+      return res.status(400).json({
+        success: false,
+        message: 'Too many failed verification attempts. Please request a new code.',
+        code: 'MAX_ATTEMPTS_EXCEEDED',
       });
     }
 
     // Verify OTP hash
     const isMatch = await bcrypt.compare(otp.toString().trim(), user.passwordResetOTPHash);
     if (!isMatch) {
+      user.passwordResetAttempts = (user.passwordResetAttempts || 0) + 1;
+      await user.save({ validateBeforeSave: false });
       return res.status(400).json({
         success: false,
-        message: 'Incorrect verification code. Please try again.',
-        errors: ['Invalid OTP code'],
+        message: `Incorrect verification code. (${5 - user.passwordResetAttempts} attempts remaining)`,
+        code: 'INVALID_OTP',
       });
     }
 
-    // Generate reset token valid for 15 mins
-    const resetToken = generateResetToken(user._id);
+    // Generate secure one-time reset token
+    const rawResetToken = crypto.randomBytes(32).toString('hex');
+    const salt = await bcrypt.genSalt(10);
+    user.passwordResetTokenHash = await bcrypt.hash(rawResetToken, salt);
+    user.passwordResetTokenExpiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 mins
+
+    // Invalidate OTP hash after successful verification
+    user.passwordResetOTPHash = null;
+    user.passwordResetOTPExpiresAt = null;
+    user.passwordResetAttempts = 0;
+    await user.save({ validateBeforeSave: false });
+
+    await logAuditEvent({
+      actor: user._id,
+      actorRole: user.role,
+      action: 'PASSWORD_RESET_OTP_VERIFIED',
+      target: user._id.toString(),
+      targetType: 'User',
+      req,
+    });
 
     res.status(200).json({
       success: true,
       message: 'OTP verified successfully. You may now reset your password.',
-      resetToken,
+      resetToken: rawResetToken,
     });
   } catch (err) {
     next(err);
@@ -353,19 +433,27 @@ exports.verifyOTP = async (req, res, next) => {
 };
 
 /**
- * @desc    Reset password using resetToken or verified OTP
+ * @desc    Reset password using verified one-time reset token
  * @route   POST /api/auth/reset-password
  * @access  Public
  */
 exports.resetPassword = async (req, res, next) => {
   try {
-    const { resetToken, email, otp, newPassword, confirmPassword } = req.body;
+    const { resetToken, email, newPassword, confirmPassword } = req.body;
 
-    if (!newPassword || newPassword.length < 6) {
+    if (!resetToken || !email || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        message: 'Reset token, email, and new password are required',
+        code: 'MISSING_FIELDS',
+      });
+    }
+
+    if (newPassword.length < 6) {
       return res.status(400).json({
         success: false,
         message: 'Password must be at least 6 characters long',
-        errors: ['Password must be at least 6 characters'],
+        code: 'PASSWORD_TOO_SHORT',
       });
     }
 
@@ -373,78 +461,65 @@ exports.resetPassword = async (req, res, next) => {
       return res.status(400).json({
         success: false,
         message: 'Passwords do not match',
-        errors: ['Passwords do not match'],
+        code: 'PASSWORD_MISMATCH',
       });
     }
 
-    let user;
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await User.findOne({ email: normalizedEmail }).select(
+      '+passwordResetTokenHash'
+    );
 
-    if (resetToken) {
-      try {
-        const decoded = jwt.verify(
-          resetToken,
-          process.env.JWT_SECRET || 'supportflow_jwt_super_secret_key_2026_secure'
-        );
-        if (decoded.purpose !== 'password_reset') {
-          return res.status(400).json({
-            success: false,
-            message: 'Invalid reset token',
-          });
-        }
-        user = await User.findById(decoded.id);
-      } catch (err) {
-        return res.status(400).json({
-          success: false,
-          message: 'Reset token has expired or is invalid. Please request a new OTP.',
-          errors: ['Invalid or expired reset token'],
-        });
-      }
-    } else if (email && otp) {
-      user = await User.findOne({
-        email: email.toLowerCase().trim(),
-      }).select('+passwordResetOTPHash');
-
-      if (!user || !user.passwordResetOTPHash || !user.passwordResetOTPExpiresAt) {
-        return res.status(400).json({
-          success: false,
-          message: 'Invalid or expired OTP',
-        });
-      }
-
-      if (new Date() > user.passwordResetOTPExpiresAt) {
-        return res.status(400).json({
-          success: false,
-          message: 'OTP has expired',
-        });
-      }
-
-      const isMatch = await bcrypt.compare(otp.toString().trim(), user.passwordResetOTPHash);
-      if (!isMatch) {
-        return res.status(400).json({
-          success: false,
-          message: 'Invalid OTP code',
-        });
-      }
-    } else {
+    if (
+      !user ||
+      !user.passwordResetTokenHash ||
+      !user.passwordResetTokenExpiresAt
+    ) {
       return res.status(400).json({
         success: false,
-        message: 'Please provide either a valid resetToken or email & OTP',
-        errors: ['Missing verification credentials'],
+        message: 'Invalid or expired reset session. Please request a new OTP.',
+        code: 'INVALID_RESET_SESSION',
       });
     }
 
-    if (!user) {
-      return res.status(404).json({
+    if (new Date() > user.passwordResetTokenExpiresAt) {
+      user.passwordResetTokenHash = null;
+      user.passwordResetTokenExpiresAt = null;
+      await user.save({ validateBeforeSave: false });
+      return res.status(400).json({
         success: false,
-        message: 'User account not found',
+        message: 'Reset token has expired. Please request a new OTP.',
+        code: 'RESET_TOKEN_EXPIRED',
+      });
+    }
+
+    // Verify resetToken hash
+    const isTokenValid = await bcrypt.compare(resetToken, user.passwordResetTokenHash);
+    if (!isTokenValid) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid reset token',
+        code: 'INVALID_RESET_TOKEN',
       });
     }
 
     // Set new password
     user.password = newPassword;
+    user.passwordResetTokenHash = null;
+    user.passwordResetTokenExpiresAt = null;
     user.passwordResetOTPHash = null;
     user.passwordResetOTPExpiresAt = null;
+    user.lastPasswordResetAt = new Date();
     await user.save();
+
+    await logAuditEvent({
+      actor: user._id,
+      actorRole: user.role,
+      action: 'PASSWORD_RESET_COMPLETED',
+      target: user._id.toString(),
+      targetType: 'User',
+      req,
+    });
 
     res.status(200).json({
       success: true,

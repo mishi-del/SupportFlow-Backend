@@ -1,16 +1,15 @@
 const express = require('express');
 const router = express.Router();
 const {
-  submitReview,
+  createReview,
   getWorkerReviews,
-  getTicketReview,
 } = require('../controllers/reviewController');
 const { protect, authorize } = require('../middleware/auth');
+const { apiWriteLimiter } = require('../middleware/rateLimiter');
 
 router.use(protect);
 
-router.post('/tickets/:id', authorize('customer'), submitReview);
-router.get('/tickets/:id', getTicketReview);
-router.get('/workers/:id', getWorkerReviews);
+router.post('/', authorize('customer'), apiWriteLimiter, createReview);
+router.get('/worker/:workerId', getWorkerReviews);
 
 module.exports = router;

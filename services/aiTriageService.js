@@ -1,46 +1,41 @@
 /**
- * Deterministic Local AI Triage Engine
- * Performs intelligent heuristic NLP categorization, priority assessment,
- * automated problem summarization, and suggested remediation steps
- * without external API calls or third-party dependencies.
+ * AI-Assisted Intelligent Triage Service
+ * Local deterministic heuristic engine for categorization, priority determination,
+ * problem summarization, and suggested remediation steps.
  */
 
 const CATEGORY_RULES = [
   {
-    category: 'Account & Security',
+    category: 'Account',
     keywords: [
       'password', 'login', '2fa', 'two-factor', 'hacked', 'unauthorized',
       'reset password', 'account', 'locked out', 'access denied', 'permission',
-      'authentication', 'token', 'credentials', 'compromised', 'phishing',
+      'authentication', 'token', 'credentials', 'compromised', 'profile',
     ],
-    baseConfidence: 0.94,
   },
   {
-    category: 'Billing & Payments',
+    category: 'Billing',
     keywords: [
       'invoice', 'billing', 'charge', 'refund', 'payment', 'credit card',
       'subscription', 'overcharge', 'receipt', 'pricing', 'plan', 'renewal',
       'stripe', 'bank', 'transaction', 'declined',
     ],
-    baseConfidence: 0.92,
   },
   {
-    category: 'Network & Connectivity',
+    category: 'Network',
     keywords: [
       'wifi', 'connection', 'vpn', 'dns', 'latency', 'ping', 'offline',
       'slow internet', 'packet loss', 'firewall', 'router', 'gateway',
       'timeout', 'cannot connect', 'unreachable', 'bandwidth',
     ],
-    baseConfidence: 0.91,
   },
   {
-    category: 'Hardware & Equipment',
+    category: 'Hardware',
     keywords: [
       'printer', 'monitor', 'screen', 'laptop', 'keyboard', 'mouse',
       'battery', 'hardware', 'cable', 'docking', 'headset', 'audio',
       'webcam', 'device', 'usb', 'power supply',
     ],
-    baseConfidence: 0.93,
   },
   {
     category: 'Technical Support',
@@ -49,15 +44,6 @@ const CATEGORY_RULES = [
       'broken', 'glitch', 'not working', 'freeze', 'blank screen',
       'database', 'api', 'server error', '500', '404', 'corrupted',
     ],
-    baseConfidence: 0.9,
-  },
-  {
-    category: 'Feature Request',
-    keywords: [
-      'feature', 'enhancement', 'suggestion', 'idea', 'would like',
-      'request for', 'new capability', 'add support for', 'improvement',
-    ],
-    baseConfidence: 0.88,
   },
 ];
 
@@ -70,32 +56,31 @@ const PRIORITY_RULES = [
       'server down', 'fatal crash', 'complete outage',
     ],
     suggestedActions: [
-      'Escalate to Tier 3 on-call incident response team immediately.',
-      'Check infrastructure status and active server telemetry.',
-      'Notify affected management stakeholders.',
+      'Immediate 15-minute SLA escalation triggered.',
+      'Check system health telemetry and infrastructure status.',
+      'Notify senior on-call team.',
     ],
   },
   {
     priority: 'Urgent',
     keywords: [
       'urgent', 'asap', 'blocking work', 'cannot work', 'high impact',
-      'deadline', 'immediate assistance', 'time sensitive', 'critical bug',
+      'deadline', 'immediate assistance', 'time sensitive',
     ],
     suggestedActions: [
-      'Acknowledge and review within 15 minutes.',
-      'Perform initial diagnostic log analysis.',
-      'Provide temporary mitigation or workaround if full fix takes time.',
+      'Review within 30 minutes.',
+      'Verify customer environment and duplicate symptoms.',
+      'Provide temporary mitigation if needed.',
     ],
   },
   {
     priority: 'High',
     keywords: [
       'important', 'payment failed', 'locked out', 'failing', 'broken',
-      'error message', 'cannot submit', 'multiple users', 'major glitch',
+      'error message', 'cannot submit', 'multiple users',
     ],
     suggestedActions: [
-      'Verify customer account authorization and credentials.',
-      'Check system logs for matching transaction or request IDs.',
+      'Verify account credentials and inspect error logs.',
       'Formulate remediation steps.',
     ],
   },
@@ -103,77 +88,79 @@ const PRIORITY_RULES = [
     priority: 'Low',
     keywords: [
       'typo', 'cosmetic', 'minor', 'question', 'curious', 'how to',
-      'documentation', 'guidance', 'inquiry', 'feature request', 'feedback',
+      'documentation', 'guidance', 'inquiry', 'feedback',
     ],
     suggestedActions: [
-      'Provide standard knowledge-base article or documentation link.',
-      'Log user feedback in product backlog if applicable.',
+      'Refer to relevant Knowledge Base articles.',
+      'Provide standard guidance.',
     ],
   },
 ];
 
 /**
- * Triage a customer support request
+ * Triage support request text
  * @param {string} subject
  * @param {string} description
- * @returns {object} { category, priority, summary, confidence, suggestedActions }
+ * @returns {object}
  */
 const triageRequest = (subject = '', description = '') => {
   const combinedText = `${subject} ${description}`.toLowerCase();
 
   // 1. Determine Category
-  let matchedCategory = 'General Inquiry';
-  let bestCategoryMatches = 0;
-  let categoryConfidence = 0.85;
+  let matchedCategory = 'General';
+  let maxCategoryHits = 0;
 
   for (const rule of CATEGORY_RULES) {
-    let matchCount = 0;
+    let hits = 0;
     for (const kw of rule.keywords) {
-      if (combinedText.includes(kw)) {
-        matchCount++;
-      }
+      if (combinedText.includes(kw)) hits++;
     }
-    if (matchCount > bestCategoryMatches) {
-      bestCategoryMatches = matchCount;
+    if (hits > maxCategoryHits) {
+      maxCategoryHits = hits;
       matchedCategory = rule.category;
-      categoryConfidence = Math.min(
-        0.98,
-        rule.baseConfidence + matchCount * 0.02
-      );
     }
   }
 
-  // 2. Determine Priority & Suggested Actions
+  // 2. Determine Priority & Remediation Suggestions
   let matchedPriority = 'Medium';
   let suggestedActions = [
     'Review request details and verify customer environment.',
-    'Contact customer through request chat to clarify symptoms.',
+    'Refer to Knowledge Base articles for standard troubleshooting.',
   ];
 
   for (const rule of PRIORITY_RULES) {
-    const hasMatch = rule.keywords.some((kw) => combinedText.includes(kw));
-    if (hasMatch) {
+    if (rule.keywords.some((kw) => combinedText.includes(kw))) {
       matchedPriority = rule.priority;
       suggestedActions = rule.suggestedActions;
       break;
     }
   }
 
-  // 3. Generate Clean Executive Summary
-  const cleanSubject = subject.trim();
-  const firstSentence = description.trim().split(/[.!?\n]/)[0] || '';
-  let summary = '';
-  if (firstSentence && firstSentence.length > 10 && firstSentence.length < 150) {
-    summary = `${cleanSubject}: ${firstSentence}.`;
+  // 3. Confidence Assessment
+  let confidenceScore = 0.85;
+  let confidenceLabel = 'Medium Confidence';
+
+  if (maxCategoryHits >= 2) {
+    confidenceScore = 0.95;
+    confidenceLabel = 'High Confidence';
+  } else if (maxCategoryHits === 1) {
+    confidenceScore = 0.88;
+    confidenceLabel = 'Medium Confidence';
   } else {
-    summary = `${cleanSubject} - Triage categorizes this under ${matchedCategory} with ${matchedPriority} priority.`;
+    confidenceScore = 0.75;
+    confidenceLabel = 'Low Confidence';
   }
+
+  // 4. Concise Summary
+  const cleanSubject = subject.trim();
+  const summary = `${cleanSubject} - AI-assisted intelligent triage recommends "${matchedCategory}" with ${matchedPriority} priority.`;
 
   return {
     category: matchedCategory,
     priority: matchedPriority,
     summary,
-    confidence: Number(categoryConfidence.toFixed(2)),
+    confidence: confidenceScore,
+    confidenceLabel,
     suggestedActions,
   };
 };

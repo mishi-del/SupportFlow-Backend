@@ -15,6 +15,7 @@ const userSchema = new mongoose.Schema(
       unique: true,
       lowercase: true,
       trim: true,
+      index: true,
       match: [
         /^\w+([.-]?\w+)*@\w+([.-]?\w+)*(\.\w{2,3})+$/,
         'Please provide a valid email address',
@@ -30,6 +31,7 @@ const userSchema = new mongoose.Schema(
       type: String,
       enum: ['customer', 'worker', 'admin'],
       default: 'customer',
+      index: true,
     },
     workerApprovalStatus: {
       type: String,
@@ -37,13 +39,16 @@ const userSchema = new mongoose.Schema(
       default: function () {
         return this.role === 'worker' ? 'pending' : 'approved';
       },
+      index: true,
     },
     isActive: {
       type: Boolean,
       default: function () {
         return this.role !== 'worker';
       },
+      index: true,
     },
+    // Password reset OTP security
     passwordResetOTPHash: {
       type: String,
       default: null,
@@ -53,11 +58,31 @@ const userSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    passwordResetAttempts: {
+      type: Number,
+      default: 0,
+      select: false,
+    },
+    passwordResetTokenHash: {
+      type: String,
+      default: null,
+      select: false,
+    },
+    passwordResetTokenExpiresAt: {
+      type: Date,
+      default: null,
+    },
+    lastPasswordResetAt: {
+      type: Date,
+      default: null,
+    },
   },
   {
     timestamps: true,
   }
 );
+
+userSchema.index({ role: 1, workerApprovalStatus: 1, isActive: 1 });
 
 // Hash password before saving if modified
 userSchema.pre('save', async function (next) {
@@ -79,6 +104,8 @@ userSchema.set('toJSON', {
   transform: function (doc, ret) {
     delete ret.password;
     delete ret.passwordResetOTPHash;
+    delete ret.passwordResetAttempts;
+    delete ret.passwordResetTokenHash;
     delete ret.__v;
     return ret;
   },

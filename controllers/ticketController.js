@@ -1,21 +1,25 @@
 const Ticket = require('../models/Ticket');
 const User = require('../models/User');
 const { triageRequest } = require('../services/aiTriageService');
-const {
-  createAndSendNotification,
-  broadcastSocketEvent,
-} = require('../services/notificationService');
+const { createAndSendNotification } = require('../services/notificationService');
+const { calculateSlaDeadline, evaluateSlaStatus } = require('../services/slaService');
+const { logAuditEvent } = require('../services/auditService');
 
 /**
  * Valid Status Transitions Matrix
  */
 const VALID_TRANSITIONS = {
-  New: ['Pending'],
   Pending: ['Accepted', 'Rejected'],
   Accepted: ['In Progress'],
   'In Progress': ['Resolved'],
-  Resolved: [], // Finalized
+  Resolved: ['Closed'],
+  Closed: ['Pending'], // Customer can reopen closed ticket
   Rejected: [], // Finalized
+};
+
+// Helper to escape regex metacharacters
+const escapeRegex = (text) => {
+  return text.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
 };
 
 /**
@@ -27,49 +31,90 @@ exports.createTicket = async (req, res, next) => {
   try {
     const { subject, description, category, priority } = req.body;
 
-    if (!subject || !description) {
+    if (!subject || !subject.trim() || !description || !description.trim()) {
       return res.status(400).json({
         success: false,
         message: 'Subject and description are required',
-        errors: ['Please provide both subject and description'],
+        code: 'MISSING_FIELDS',
+      });
+    }
+
+    if (subject.trim().length > 200) {
+      return res.status(400).json({
+        success: false,
+        message: 'Subject cannot exceed 200 characters',
+        code: 'SUBJECT_TOO_LONG',
+      });
+    }
+
+    if (description.trim().length > 5000) {
+      return res.status(400).json({
+        success: false,
+        message: 'Description cannot exceed 5000 characters',
+        code: 'DESCRIPTION_TOO_LONG',
       });
     }
 
     // Run deterministic local AI triage
     const aiResult = triageRequest(subject, description);
+    const chosenPriority = priority || aiResult.priority;
+    const slaDeadline = calculateSlaDeadline(chosenPriority, new Date());
+
+    // Process file attachments if uploaded
+    const attachments = [];
+    if (req.files && req.files.length > 0) {
+      req.files.forEach((file) => {
+        attachments.push({
+          filename: file.filename,
+          originalName: file.originalname,
+          mimeType: file.mimetype,
+          size: file.size,
+          url: `/uploads/${file.filename}`,
+        });
+      });
+    }
 
     const ticket = await Ticket.create({
       customer: req.user._id,
       subject: subject.trim(),
       description: description.trim(),
       category: category || aiResult.category,
-      priority: priority || aiResult.priority,
+      priority: chosenPriority,
       status: 'Pending',
       aiTriage: aiResult,
+      slaDeadline,
+      slaStatus: 'Within SLA',
+      attachments,
       statusHistory: [
         {
           status: 'Pending',
           changedBy: req.user._id,
-          note: 'Request created by customer and queued for worker review.',
+          note: 'Request created by customer and placed in Available pool.',
           changedAt: new Date(),
         },
       ],
     });
 
-    // Populate customer info for return
     await ticket.populate('customer', 'name email');
 
-    // Notify available workers and admins
-    broadcastSocketEvent('ticket-created', ticket);
-
-    // Create notification for Customer confirming receipt
+    // Create database notification for customer
     await createAndSendNotification({
       recipient: req.user._id,
       ticket: ticket._id,
       type: 'ticket_created',
       title: 'Request Submitted',
-      message: `Your request "${ticket.subject}" (${ticket.ticketNumber}) has been submitted and is pending worker review.`,
+      message: `Your request "${ticket.subject}" (${ticket.ticketNumber}) has been submitted.`,
       link: `/customer/requests/${ticket._id}`,
+    });
+
+    await logAuditEvent({
+      actor: req.user._id,
+      actorRole: 'customer',
+      action: 'TICKET_CREATED',
+      target: ticket.ticketNumber,
+      targetType: 'Ticket',
+      metadata: { category: ticket.category, priority: ticket.priority },
+      req,
     });
 
     res.status(201).json({
@@ -83,61 +128,102 @@ exports.createTicket = async (req, res, next) => {
 };
 
 /**
- * @desc    Get all tickets with role-based filtering
+ * @desc    Get all tickets with secure visibility isolation, search & pagination
  * @route   GET /api/tickets
  * @access  Private
  */
 exports.getTickets = async (req, res, next) => {
   try {
-    const { status, priority, category, search, view } = req.query;
-    let query = {};
+    const { status, priority, category, search, view, page = 1, limit = 20, sort = '-createdAt' } = req.query;
 
-    // Role-based visibility isolation
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+    const skip = (pageNum - 1) * limitNum;
+
+    // 1. Mandatory Role-Based Visibility Query (Source of Truth)
+    let visibilityQuery = {};
     if (req.user.role === 'customer') {
-      query.customer = req.user._id;
+      visibilityQuery = { customer: req.user._id };
     } else if (req.user.role === 'worker') {
       if (view === 'available') {
-        // Available queue: Pending and unassigned
-        query.status = 'Pending';
-        query.assignedWorker = null;
+        visibilityQuery = { status: 'Pending', assignedWorker: null };
       } else if (view === 'all') {
-        // Worker viewing all assigned or available
-        query.$or = [{ assignedWorker: req.user._id }, { status: 'Pending' }];
+        visibilityQuery = {
+          $or: [{ assignedWorker: req.user._id }, { status: 'Pending', assignedWorker: null }],
+        };
       } else {
-        // Default worker view: assigned to this worker
-        query.assignedWorker = req.user._id;
+        // Default worker view: only assigned tickets
+        visibilityQuery = { assignedWorker: req.user._id };
       }
     }
     // Admin sees all by default
 
-    // Additional query filters
+    // 2. Build AND-query clauses so search NEVER bypasses visibility
+    const andClauses = [visibilityQuery];
+
+    // Filter by status
     if (status && status !== 'all') {
-      query.status = status;
-    }
-    if (priority && priority !== 'all') {
-      query.priority = priority;
-    }
-    if (category && category !== 'all') {
-      query.category = category;
-    }
-    if (search) {
-      const searchRegex = new RegExp(search.trim(), 'i');
-      query.$or = [
-        { subject: searchRegex },
-        { description: searchRegex },
-        { ticketNumber: searchRegex },
-      ];
+      andClauses.push({ status });
     }
 
-    const tickets = await Ticket.find(query)
-      .populate('customer', 'name email')
-      .populate('assignedWorker', 'name email')
-      .sort({ createdAt: -1 });
+    // Filter by priority
+    if (priority && priority !== 'all') {
+      andClauses.push({ priority });
+    }
+
+    // Filter by category
+    if (category && category !== 'all') {
+      andClauses.push({ category });
+    }
+
+    // Filter by escalated
+    if (req.query.escalated === 'true') {
+      andClauses.push({ isEscalated: true });
+    }
+
+    // Search query with regex escaping (Max 100 chars)
+    if (search && search.trim()) {
+      const sanitized = escapeRegex(search.trim().slice(0, 100));
+      const searchRegex = new RegExp(sanitized, 'i');
+      andClauses.push({
+        $or: [
+          { subject: searchRegex },
+          { description: searchRegex },
+          { ticketNumber: searchRegex },
+        ],
+      });
+    }
+
+    const finalQuery = andClauses.length === 1 ? andClauses[0] : { $and: andClauses };
+
+    const [total, tickets] = await Promise.all([
+      Ticket.countDocuments(finalQuery),
+      Ticket.find(finalQuery)
+        .populate('customer', 'name email')
+        .populate('assignedWorker', 'name email')
+        .populate('escalatedBy', 'name role')
+        .sort(sort)
+        .skip(skip)
+        .limit(limitNum)
+        .lean(),
+    ]);
+
+    // Compute live SLA status for each ticket
+    const formattedTickets = tickets.map((t) => ({
+      ...t,
+      slaStatus: evaluateSlaStatus(t),
+    }));
 
     res.status(200).json({
       success: true,
-      count: tickets.length,
-      tickets,
+      count: formattedTickets.length,
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total,
+        pages: Math.ceil(total / limitNum) || 1,
+      },
+      tickets: formattedTickets,
     });
   } catch (err) {
     next(err);
@@ -145,7 +231,7 @@ exports.getTickets = async (req, res, next) => {
 };
 
 /**
- * @desc    Get single ticket details
+ * @desc    Get single ticket details with authorization check
  * @route   GET /api/tickets/:id
  * @access  Private
  */
@@ -155,41 +241,47 @@ exports.getTicketById = async (req, res, next) => {
       .populate('customer', 'name email createdAt')
       .populate('assignedWorker', 'name email')
       .populate('statusHistory.changedBy', 'name role')
-      .populate('messages.sender', 'name role');
+      .populate('messages.sender', 'name role')
+      .populate('escalatedBy', 'name role');
 
     if (!ticket) {
       return res.status(404).json({
         success: false,
         message: 'Request not found',
-        errors: ['No ticket matching the requested ID'],
+        code: 'TICKET_NOT_FOUND',
       });
     }
 
-    // Authorization check
+    // Authorization verification
     if (req.user.role === 'customer') {
       if (ticket.customer._id.toString() !== req.user._id.toString()) {
         return res.status(403).json({
           success: false,
           message: 'Forbidden: You are not authorized to view this request.',
+          code: 'FORBIDDEN',
         });
       }
     } else if (req.user.role === 'worker') {
-      // Worker can view if assigned OR if ticket is pending (available pool)
       const isAssigned =
         ticket.assignedWorker &&
         ticket.assignedWorker._id.toString() === req.user._id.toString();
-      const isPending = ticket.status === 'Pending';
-      if (!isAssigned && !isPending) {
+      const isPendingUnassigned = ticket.status === 'Pending' && !ticket.assignedWorker;
+
+      if (!isAssigned && !isPendingUnassigned) {
         return res.status(403).json({
           success: false,
           message: 'Forbidden: You are not assigned to this request.',
+          code: 'FORBIDDEN',
         });
       }
     }
 
+    const ticketObj = ticket.toObject();
+    ticketObj.slaStatus = evaluateSlaStatus(ticket);
+
     res.status(200).json({
       success: true,
-      ticket,
+      ticket: ticketObj,
     });
   } catch (err) {
     next(err);
@@ -197,50 +289,48 @@ exports.getTicketById = async (req, res, next) => {
 };
 
 /**
- * @desc    Worker accepts a pending request
+ * @desc    Worker claims/accepts pending request atomically
  * @route   POST /api/workers/requests/:id/accept
  * @access  Private (Worker)
  */
 exports.acceptTicket = async (req, res, next) => {
   try {
-    const ticket = await Ticket.findById(req.params.id);
+    const ticketId = req.params.id;
+
+    // Atomic findOneAndUpdate eliminates acceptance race condition
+    const ticket = await Ticket.findOneAndUpdate(
+      {
+        _id: ticketId,
+        status: 'Pending',
+        assignedWorker: null,
+      },
+      {
+        $set: {
+          assignedWorker: req.user._id,
+          status: 'Accepted',
+          acceptedAt: new Date(),
+        },
+        $push: {
+          statusHistory: {
+            status: 'Accepted',
+            changedBy: req.user._id,
+            note: `Accepted by Worker ${req.user.name}`,
+            changedAt: new Date(),
+          },
+        },
+      },
+      { new: true }
+    )
+      .populate('customer', 'name email')
+      .populate('assignedWorker', 'name email');
 
     if (!ticket) {
-      return res.status(404).json({
-        success: false,
-        message: 'Request not found',
-      });
-    }
-
-    if (ticket.status !== 'Pending') {
       return res.status(400).json({
         success: false,
-        message: `Cannot accept request. Current status is already '${ticket.status}'.`,
-        errors: ['Request is no longer pending'],
+        message: 'This request has already been claimed by another worker or is no longer pending.',
+        code: 'TICKET_ALREADY_CLAIMED',
       });
     }
-
-    if (ticket.assignedWorker) {
-      return res.status(400).json({
-        success: false,
-        message: 'This request has already been accepted by another worker.',
-        errors: ['Request already assigned'],
-      });
-    }
-
-    ticket.assignedWorker = req.user._id;
-    ticket.status = 'Accepted';
-    ticket.acceptedAt = new Date();
-    ticket.statusHistory.push({
-      status: 'Accepted',
-      changedBy: req.user._id,
-      note: `Accepted by Worker ${req.user.name}`,
-      changedAt: new Date(),
-    });
-
-    await ticket.save();
-    await ticket.populate('customer', 'name email');
-    await ticket.populate('assignedWorker', 'name email');
 
     // Notify Customer
     await createAndSendNotification({
@@ -252,12 +342,13 @@ exports.acceptTicket = async (req, res, next) => {
       link: `/customer/requests/${ticket._id}`,
     });
 
-    // Broadcast real-time event
-    broadcastSocketEvent(`ticket_${ticket._id}`, 'ticket-accepted', ticket);
-    broadcastSocketEvent('ticket-status-updated', {
-      ticketId: ticket._id,
-      status: 'Accepted',
-      assignedWorker: ticket.assignedWorker,
+    await logAuditEvent({
+      actor: req.user._id,
+      actorRole: 'worker',
+      action: 'TICKET_ACCEPTED',
+      target: ticket.ticketNumber,
+      targetType: 'Ticket',
+      req,
     });
 
     res.status(200).json({
@@ -278,49 +369,56 @@ exports.acceptTicket = async (req, res, next) => {
 exports.rejectTicket = async (req, res, next) => {
   try {
     const { note = '' } = req.body;
-    const ticket = await Ticket.findById(req.params.id);
+    const ticketId = req.params.id;
+
+    const ticket = await Ticket.findOneAndUpdate(
+      {
+        _id: ticketId,
+        status: 'Pending',
+      },
+      {
+        $set: {
+          status: 'Rejected',
+          rejectedAt: new Date(),
+        },
+        $push: {
+          statusHistory: {
+            status: 'Rejected',
+            changedBy: req.user._id,
+            note: note.trim() || `Rejected by Worker ${req.user.name}`,
+            changedAt: new Date(),
+          },
+        },
+      },
+      { new: true }
+    ).populate('customer', 'name email');
 
     if (!ticket) {
-      return res.status(404).json({
-        success: false,
-        message: 'Request not found',
-      });
-    }
-
-    if (ticket.status !== 'Pending') {
       return res.status(400).json({
         success: false,
-        message: `Cannot reject request. Current status is '${ticket.status}'. Only Pending requests can be rejected.`,
-        errors: ['Request is no longer pending'],
+        message: 'Cannot reject request. Only Pending requests can be rejected.',
+        code: 'INVALID_STATUS_TRANSITION',
       });
     }
-
-    ticket.status = 'Rejected';
-    ticket.rejectedAt = new Date();
-    ticket.statusHistory.push({
-      status: 'Rejected',
-      changedBy: req.user._id,
-      note: note.trim() || `Rejected by Worker ${req.user.name}`,
-      changedAt: new Date(),
-    });
-
-    await ticket.save();
-    await ticket.populate('customer', 'name email');
 
     // Notify Customer
     await createAndSendNotification({
       recipient: ticket.customer._id,
       ticket: ticket._id,
       type: 'ticket_rejected',
-      title: 'Request Rejected',
-      message: `Your request "${ticket.subject}" (${ticket.ticketNumber}) was rejected by the service team.`,
+      title: 'Request Declined',
+      message: `Your request "${ticket.subject}" (${ticket.ticketNumber}) was declined by the service team.`,
       link: `/customer/requests/${ticket._id}`,
     });
 
-    broadcastSocketEvent(`ticket_${ticket._id}`, 'ticket-rejected', ticket);
-    broadcastSocketEvent('ticket-status-updated', {
-      ticketId: ticket._id,
-      status: 'Rejected',
+    await logAuditEvent({
+      actor: req.user._id,
+      actorRole: 'worker',
+      action: 'TICKET_REJECTED',
+      target: ticket.ticketNumber,
+      targetType: 'Ticket',
+      metadata: { note },
+      req,
     });
 
     res.status(200).json({
@@ -334,9 +432,9 @@ exports.rejectTicket = async (req, res, next) => {
 };
 
 /**
- * @desc    Update ticket status strictly enforcing one-way transitions
+ * @desc    Update ticket status with strict state machine validation
  * @route   PUT /api/workers/requests/:id/status
- * @access  Private (Worker)
+ * @access  Private (Worker, Admin)
  */
 exports.updateTicketStatus = async (req, res, next) => {
   try {
@@ -347,17 +445,21 @@ exports.updateTicketStatus = async (req, res, next) => {
       return res.status(404).json({
         success: false,
         message: 'Request not found',
+        code: 'TICKET_NOT_FOUND',
       });
     }
 
-    // Verify Worker assignment
-    if (
-      !ticket.assignedWorker ||
-      ticket.assignedWorker.toString() !== req.user._id.toString()
-    ) {
+    // Role check: Worker must be assigned; Admin has oversight
+    const isAssignedWorker =
+      ticket.assignedWorker &&
+      ticket.assignedWorker.toString() === req.user._id.toString();
+    const isAdmin = req.user.role === 'admin';
+
+    if (!isAssignedWorker && !isAdmin) {
       return res.status(403).json({
         success: false,
         message: 'Forbidden: You can only update requests assigned to you.',
+        code: 'FORBIDDEN',
       });
     }
 
@@ -370,13 +472,17 @@ exports.updateTicketStatus = async (req, res, next) => {
         message: `Invalid status transition from '${currentStatus}' to '${nextStatus}'. Allowed transitions from '${currentStatus}' are: [${allowedNext.join(
           ', '
         )}]`,
-        errors: [`Cannot transition from ${currentStatus} to ${nextStatus}`],
+        code: 'INVALID_STATUS_TRANSITION',
       });
     }
 
     ticket.status = nextStatus;
     if (nextStatus === 'Resolved') {
       ticket.resolvedAt = new Date();
+      ticket.slaStatus = evaluateSlaStatus(ticket);
+    } else if (nextStatus === 'Closed') {
+      ticket.closedAt = new Date();
+      ticket.closedBy = req.user._id;
     }
 
     ticket.statusHistory.push({
@@ -390,24 +496,38 @@ exports.updateTicketStatus = async (req, res, next) => {
     await ticket.populate('customer', 'name email');
     await ticket.populate('assignedWorker', 'name email');
 
-    // Notify Customer of status change
+    // Notify Customer
     const isResolved = nextStatus === 'Resolved';
+    const isClosed = nextStatus === 'Closed';
+
     await createAndSendNotification({
       recipient: ticket.customer._id,
       ticket: ticket._id,
-      type: isResolved ? 'ticket_resolved' : 'ticket_status_updated',
-      title: isResolved ? 'Request Completed & Resolved' : 'Request Status Updated',
+      type: isResolved
+        ? 'ticket_resolved'
+        : isClosed
+        ? 'ticket_closed'
+        : 'ticket_status_updated',
+      title: isResolved
+        ? 'Request Completed & Resolved'
+        : isClosed
+        ? 'Request Closed'
+        : 'Request Status Updated',
       message: isResolved
-        ? `Your request "${ticket.subject}" (${ticket.ticketNumber}) has been completed. Please rate your service experience!`
+        ? `Your request "${ticket.subject}" (${ticket.ticketNumber}) has been resolved. Please rate your service experience!`
         : `Your request "${ticket.subject}" (${ticket.ticketNumber}) is now "${nextStatus}".`,
       link: `/customer/requests/${ticket._id}`,
     });
 
-    // Real-time socket dispatch
-    broadcastSocketEvent(`ticket_${ticket._id}`, 'ticket-status-updated', ticket);
-    if (isResolved) {
-      broadcastSocketEvent(`ticket_${ticket._id}`, 'ticket-resolved', ticket);
-    }
+    await logAuditEvent({
+      actor: req.user._id,
+      actorRole: req.user.role,
+      action: 'TICKET_STATUS_CHANGED',
+      target: ticket.ticketNumber,
+      targetType: 'Ticket',
+      metadata: { from: currentStatus, to: nextStatus, note },
+      req,
+    });
 
     res.status(200).json({
       success: true,
@@ -420,9 +540,215 @@ exports.updateTicketStatus = async (req, res, next) => {
 };
 
 /**
- * @desc    Update ticket operational priority (Worker only)
+ * @desc    Customer closes a resolved request
+ * @route   PUT /api/tickets/:id/close
+ * @access  Private (Customer, Admin)
+ */
+exports.closeTicket = async (req, res, next) => {
+  try {
+    const ticket = await Ticket.findById(req.params.id);
+
+    if (!ticket) {
+      return res.status(404).json({
+        success: false,
+        message: 'Request not found',
+        code: 'TICKET_NOT_FOUND',
+      });
+    }
+
+    if (
+      req.user.role === 'customer' &&
+      ticket.customer.toString() !== req.user._id.toString()
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: 'Forbidden: You can only close your own requests.',
+        code: 'FORBIDDEN',
+      });
+    }
+
+    if (ticket.status !== 'Resolved') {
+      return res.status(400).json({
+        success: false,
+        message: `Only Resolved requests can be closed. Current status is '${ticket.status}'.`,
+        code: 'INVALID_STATUS_TRANSITION',
+      });
+    }
+
+    ticket.status = 'Closed';
+    ticket.closedAt = new Date();
+    ticket.closedBy = req.user._id;
+    ticket.statusHistory.push({
+      status: 'Closed',
+      changedBy: req.user._id,
+      note: `Closed by ${req.user.name}`,
+      changedAt: new Date(),
+    });
+
+    await ticket.save();
+
+    await logAuditEvent({
+      actor: req.user._id,
+      actorRole: req.user.role,
+      action: 'TICKET_CLOSED',
+      target: ticket.ticketNumber,
+      targetType: 'Ticket',
+      req,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Request closed successfully',
+      ticket,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * @desc    Customer reopens a closed request
+ * @route   PUT /api/tickets/:id/reopen
+ * @access  Private (Customer)
+ */
+exports.reopenTicket = async (req, res, next) => {
+  try {
+    const { reason = '' } = req.body;
+    const ticket = await Ticket.findById(req.params.id);
+
+    if (!ticket) {
+      return res.status(404).json({
+        success: false,
+        message: 'Request not found',
+        code: 'TICKET_NOT_FOUND',
+      });
+    }
+
+    if (ticket.customer.toString() !== req.user._id.toString()) {
+      return res.status(403).json({
+        success: false,
+        message: 'Forbidden: You can only reopen your own requests.',
+        code: 'FORBIDDEN',
+      });
+    }
+
+    if (ticket.status !== 'Closed') {
+      return res.status(400).json({
+        success: false,
+        message: `Only Closed requests can be reopened. Current status is '${ticket.status}'.`,
+        code: 'INVALID_STATUS_TRANSITION',
+      });
+    }
+
+    ticket.status = 'Pending';
+    ticket.assignedWorker = null; // Re-enters available pool
+    ticket.resolvedAt = null;
+    ticket.closedAt = null;
+    ticket.statusHistory.push({
+      status: 'Pending',
+      changedBy: req.user._id,
+      note: reason.trim() ? `Reopened by customer: ${reason}` : 'Reopened by customer',
+      changedAt: new Date(),
+    });
+
+    await ticket.save();
+
+    await logAuditEvent({
+      actor: req.user._id,
+      actorRole: 'customer',
+      action: 'TICKET_REOPENED',
+      target: ticket.ticketNumber,
+      targetType: 'Ticket',
+      metadata: { reason },
+      req,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Request reopened and placed in Available pool',
+      ticket,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * @desc    Escalate ticket to Senior Worker / Admin
+ * @route   POST /api/tickets/:id/escalate
+ * @access  Private (Worker, Admin)
+ */
+exports.escalateTicket = async (req, res, next) => {
+  try {
+    const { reason } = req.body;
+    const ticket = await Ticket.findById(req.params.id);
+
+    if (!ticket) {
+      return res.status(404).json({
+        success: false,
+        message: 'Request not found',
+        code: 'TICKET_NOT_FOUND',
+      });
+    }
+
+    ticket.isEscalated = true;
+    ticket.escalationReason = (reason || 'Escalated by service team for specialized attention').trim();
+    ticket.escalatedAt = new Date();
+    ticket.escalatedBy = req.user._id;
+
+    // Bump priority to Critical if not already
+    if (ticket.priority !== 'Critical') {
+      ticket.priority = 'Critical';
+      ticket.slaDeadline = calculateSlaDeadline('Critical', new Date());
+    }
+
+    ticket.statusHistory.push({
+      status: ticket.status,
+      changedBy: req.user._id,
+      note: `Escalated by ${req.user.name}: ${ticket.escalationReason}`,
+      changedAt: new Date(),
+    });
+
+    await ticket.save();
+    await ticket.populate('customer', 'name email');
+
+    // Notify all Admins
+    const admins = await User.find({ role: 'admin' });
+    for (const admin of admins) {
+      await createAndSendNotification({
+        recipient: admin._id,
+        ticket: ticket._id,
+        type: 'ticket_escalated',
+        title: 'Critical Ticket Escalated',
+        message: `Request ${ticket.ticketNumber} (${ticket.subject}) was escalated by ${req.user.name}. Reason: ${ticket.escalationReason}`,
+        link: `/customer/requests/${ticket._id}`,
+      });
+    }
+
+    await logAuditEvent({
+      actor: req.user._id,
+      actorRole: req.user.role,
+      action: 'TICKET_ESCALATED',
+      target: ticket.ticketNumber,
+      targetType: 'Ticket',
+      metadata: { reason: ticket.escalationReason },
+      req,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Ticket successfully escalated',
+      ticket,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * @desc    Update ticket operational priority (Worker, Admin)
  * @route   PUT /api/workers/requests/:id/priority
- * @access  Private (Worker)
+ * @access  Private (Worker, Admin)
  */
 exports.updateTicketPriority = async (req, res, next) => {
   try {
@@ -432,9 +758,8 @@ exports.updateTicketPriority = async (req, res, next) => {
     if (!validPriorities.includes(priority)) {
       return res.status(400).json({
         success: false,
-        message: `Invalid priority '${priority}'. Allowed priorities are: ${validPriorities.join(
-          ', '
-        )}`,
+        message: `Invalid priority '${priority}'. Allowed values: ${validPriorities.join(', ')}`,
+        code: 'INVALID_PRIORITY',
       });
     }
 
@@ -444,46 +769,103 @@ exports.updateTicketPriority = async (req, res, next) => {
       return res.status(404).json({
         success: false,
         message: 'Request not found',
+        code: 'TICKET_NOT_FOUND',
       });
     }
 
-    // Only assigned worker can change priority
-    if (
-      !ticket.assignedWorker ||
-      ticket.assignedWorker.toString() !== req.user._id.toString()
-    ) {
+    const isAssignedWorker =
+      ticket.assignedWorker &&
+      ticket.assignedWorker.toString() === req.user._id.toString();
+    const isAdmin = req.user.role === 'admin';
+
+    if (!isAssignedWorker && !isAdmin) {
       return res.status(403).json({
         success: false,
-        message: 'Forbidden: Only the assigned worker can change request priority.',
+        message: 'Forbidden: Only the assigned worker or administrator can change priority.',
+        code: 'FORBIDDEN',
       });
     }
 
     const oldPriority = ticket.priority;
     ticket.priority = priority;
+    ticket.slaDeadline = calculateSlaDeadline(priority, ticket.createdAt || new Date());
     await ticket.save();
 
     await ticket.populate('customer', 'name email');
     await ticket.populate('assignedWorker', 'name email');
 
-    // Notify Customer of priority change
+    // Notify Customer
     await createAndSendNotification({
       recipient: ticket.customer._id,
       ticket: ticket._id,
       type: 'ticket_priority_updated',
       title: 'Priority Updated',
-      message: `Worker ${req.user.name} changed your request priority from ${oldPriority} to ${priority}.`,
+      message: `Worker ${req.user.name} updated your request priority from ${oldPriority} to ${priority}.`,
       link: `/customer/requests/${ticket._id}`,
     });
 
-    broadcastSocketEvent(`ticket_${ticket._id}`, 'ticket-priority-updated', {
-      ticketId: ticket._id,
-      priority,
+    await logAuditEvent({
+      actor: req.user._id,
+      actorRole: req.user.role,
+      action: 'TICKET_PRIORITY_CHANGED',
+      target: ticket.ticketNumber,
+      targetType: 'Ticket',
+      metadata: { from: oldPriority, to: priority },
+      req,
     });
 
     res.status(200).json({
       success: true,
       message: `Priority updated to '${priority}'`,
       ticket,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * @desc    Get messages of a ticket (polling supported with 'after' timestamp query)
+ * @route   GET /api/tickets/:id/messages
+ * @access  Private (Customer owner, Assigned Worker, Admin)
+ */
+exports.getTicketMessages = async (req, res, next) => {
+  try {
+    const { after } = req.query;
+    const ticket = await Ticket.findById(req.params.id);
+
+    if (!ticket) {
+      return res.status(404).json({
+        success: false,
+        message: 'Request not found',
+        code: 'TICKET_NOT_FOUND',
+      });
+    }
+
+    const isCustomerOwner = ticket.customer.toString() === req.user._id.toString();
+    const isAssignedWorker =
+      ticket.assignedWorker && ticket.assignedWorker.toString() === req.user._id.toString();
+    const isAdmin = req.user.role === 'admin';
+
+    if (!isCustomerOwner && !isAssignedWorker && !isAdmin) {
+      return res.status(403).json({
+        success: false,
+        message: 'Forbidden: You are not authorized to view this conversation.',
+        code: 'FORBIDDEN',
+      });
+    }
+
+    let messages = ticket.messages || [];
+
+    if (after) {
+      const afterDate = new Date(after);
+      messages = messages.filter((m) => new Date(m.createdAt) > afterDate);
+    }
+
+    res.status(200).json({
+      success: true,
+      count: messages.length,
+      messages,
     });
   } catch (err) {
     next(err);
@@ -503,6 +885,15 @@ exports.addMessage = async (req, res, next) => {
       return res.status(400).json({
         success: false,
         message: 'Message text cannot be empty',
+        code: 'EMPTY_MESSAGE',
+      });
+    }
+
+    if (text.trim().length > 2000) {
+      return res.status(400).json({
+        success: false,
+        message: 'Message cannot exceed 2000 characters',
+        code: 'MESSAGE_TOO_LONG',
       });
     }
 
@@ -512,20 +903,34 @@ exports.addMessage = async (req, res, next) => {
       return res.status(404).json({
         success: false,
         message: 'Request not found',
+        code: 'TICKET_NOT_FOUND',
       });
     }
 
-    const isCustomerOwner =
-      ticket.customer.toString() === req.user._id.toString();
+    const isCustomerOwner = ticket.customer.toString() === req.user._id.toString();
     const isAssignedWorker =
-      ticket.assignedWorker &&
-      ticket.assignedWorker.toString() === req.user._id.toString();
+      ticket.assignedWorker && ticket.assignedWorker.toString() === req.user._id.toString();
     const isAdmin = req.user.role === 'admin';
 
     if (!isCustomerOwner && !isAssignedWorker && !isAdmin) {
       return res.status(403).json({
         success: false,
         message: 'Forbidden: You are not authorized to participate in this conversation.',
+        code: 'FORBIDDEN',
+      });
+    }
+
+    // Attachments if uploaded
+    const attachments = [];
+    if (req.files && req.files.length > 0) {
+      req.files.forEach((file) => {
+        attachments.push({
+          filename: file.filename,
+          originalName: file.originalname,
+          mimeType: file.mimetype,
+          size: file.size,
+          url: `/uploads/${file.filename}`,
+        });
       });
     }
 
@@ -534,13 +939,19 @@ exports.addMessage = async (req, res, next) => {
       senderRole: req.user.role,
       senderName: req.user.name,
       text: text.trim(),
+      attachments,
       createdAt: new Date(),
     };
+
+    // Track first worker response timestamp for SLA analytics
+    if (isAssignedWorker && !ticket.slaFirstResponseAt) {
+      ticket.slaFirstResponseAt = new Date();
+    }
 
     ticket.messages.push(newMessage);
     await ticket.save();
 
-    // Determine notification recipient (the other participant)
+    // Determine recipient for notification
     let recipientId = null;
     if (isCustomerOwner && ticket.assignedWorker) {
       recipientId = ticket.assignedWorker;
@@ -561,12 +972,6 @@ exports.addMessage = async (req, res, next) => {
             : `/customer/requests/${ticket._id}`,
       });
     }
-
-    // Broadcast message to ticket room
-    broadcastSocketEvent(`ticket_${ticket._id}`, 'new-message', {
-      ticketId: ticket._id,
-      message: newMessage,
-    });
 
     res.status(201).json({
       success: true,

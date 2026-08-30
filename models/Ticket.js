@@ -1,4 +1,17 @@
 const mongoose = require('mongoose');
+const { getNextTicketNumber } = require('./Counter');
+const { calculateSlaDeadline } = require('../services/slaService');
+
+const attachmentSchema = new mongoose.Schema(
+  {
+    filename: { type: String, required: true },
+    originalName: { type: String, required: true },
+    mimeType: { type: String, required: true },
+    size: { type: Number, required: true },
+    url: { type: String, required: true },
+  },
+  { _id: false }
+);
 
 const messageSchema = new mongoose.Schema(
   {
@@ -22,6 +35,7 @@ const messageSchema = new mongoose.Schema(
       trim: true,
       maxlength: [2000, 'Message cannot exceed 2000 characters'],
     },
+    attachments: [attachmentSchema],
   },
   {
     timestamps: { createdAt: true, updatedAt: false },
@@ -79,19 +93,22 @@ const ticketSchema = new mongoose.Schema(
       type: String,
       required: [true, 'Description is required'],
       trim: true,
+      maxlength: [5000, 'Description cannot exceed 5000 characters'],
     },
     category: {
       type: String,
       default: 'General Inquiry',
+      index: true,
     },
     priority: {
       type: String,
       enum: ['Low', 'Medium', 'High', 'Critical', 'Urgent'],
       default: 'Medium',
+      index: true,
     },
     status: {
       type: String,
-      enum: ['New', 'Pending', 'Accepted', 'In Progress', 'Resolved', 'Rejected'],
+      enum: ['Pending', 'Accepted', 'In Progress', 'Resolved', 'Rejected', 'Closed'],
       default: 'Pending',
       index: true,
     },
@@ -100,8 +117,44 @@ const ticketSchema = new mongoose.Schema(
       priority: { type: String, default: 'Medium' },
       summary: { type: String, default: '' },
       confidence: { type: Number, default: 0.85 },
+      confidenceLabel: { type: String, default: 'High Confidence' },
       suggestedActions: [{ type: String }],
     },
+    // SLA Management
+    slaDeadline: {
+      type: Date,
+      index: true,
+    },
+    slaFirstResponseAt: {
+      type: Date,
+      default: null,
+    },
+    slaStatus: {
+      type: String,
+      enum: ['Within SLA', 'SLA Breached', 'SLA Met'],
+      default: 'Within SLA',
+      index: true,
+    },
+    // Escalation Management
+    isEscalated: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    escalationReason: {
+      type: String,
+      default: '',
+    },
+    escalatedAt: {
+      type: Date,
+      default: null,
+    },
+    escalatedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
+    // Lifecycle Timestamps
     acceptedAt: {
       type: Date,
       default: null,
@@ -114,10 +167,20 @@ const ticketSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    closedAt: {
+      type: Date,
+      default: null,
+    },
+    closedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
     hasReview: {
       type: Boolean,
       default: false,
     },
+    attachments: [attachmentSchema],
     statusHistory: [statusHistorySchema],
     messages: [messageSchema],
   },
@@ -126,12 +189,18 @@ const ticketSchema = new mongoose.Schema(
   }
 );
 
-// Auto-generate ticketNumber (e.g. SF-1001, SF-1002...)
+// Indexes
+ticketSchema.index({ customer: 1, createdAt: -1 });
+ticketSchema.index({ assignedWorker: 1, status: 1 });
+ticketSchema.index({ status: 1, priority: 1, createdAt: -1 });
+
+// Atomic sequential ticket number & SLA initialization
 ticketSchema.pre('save', async function (next) {
-  if (!this.ticketNumber) {
-    const count = await mongoose.model('Ticket').countDocuments();
-    const nextNum = 1000 + count + 1;
-    this.ticketNumber = `SF-${nextNum}`;
+  if (this.isNew && !this.ticketNumber) {
+    this.ticketNumber = await getNextTicketNumber();
+  }
+  if (this.isNew && !this.slaDeadline) {
+    this.slaDeadline = calculateSlaDeadline(this.priority, this.createdAt || new Date());
   }
   next();
 });

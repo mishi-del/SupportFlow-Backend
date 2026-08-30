@@ -1,23 +1,27 @@
 const express = require('express');
 const router = express.Router();
 const {
-  getDashboardStats,
-  getWorkerRequests,
+  getAdminStats,
+  getPendingWorkers,
   approveWorker,
   rejectWorker,
   getAllUsers,
-  toggleUserActive,
+  toggleUserStatus,
+  reassignWorker,
+  getAuditLogs,
 } = require('../controllers/adminController');
-const { protect, authorize } = require('../middleware/auth');
+const { protect, requireAdmin } = require('../middleware/auth');
 
 router.use(protect);
-router.use(authorize('admin'));
+router.use(requireAdmin);
 
-router.get('/stats', getDashboardStats);
-router.get('/worker-requests', getWorkerRequests);
-router.post('/workers/:id/approve', approveWorker);
-router.post('/workers/:id/reject', rejectWorker);
+router.get('/stats', getAdminStats);
+router.get('/workers/pending', getPendingWorkers);
+router.put('/workers/:id/approve', approveWorker);
+router.put('/workers/:id/reject', rejectWorker);
 router.get('/users', getAllUsers);
-router.put('/users/:id/toggle-active', toggleUserActive);
+router.put('/users/:id/toggle-status', toggleUserStatus);
+router.put('/tickets/:id/reassign', reassignWorker);
+router.get('/audit-logs', getAuditLogs);
 
 module.exports = router;

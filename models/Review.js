@@ -7,11 +7,13 @@ const reviewSchema = new mongoose.Schema(
       ref: 'Ticket',
       required: [true, 'Ticket reference is required'],
       unique: true,
+      index: true,
     },
     customer: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
       required: [true, 'Customer is required'],
+      index: true,
     },
     worker: {
       type: mongoose.Schema.Types.ObjectId,
@@ -40,5 +42,7 @@ const reviewSchema = new mongoose.Schema(
     timestamps: true,
   }
 );
+
+reviewSchema.index({ worker: 1, createdAt: -1 });
 
 module.exports = mongoose.model('Review', reviewSchema);

@@ -5,7 +5,9 @@ const User = require('../models/User');
 const Ticket = require('../models/Ticket');
 const Notification = require('../models/Notification');
 const Review = require('../models/Review');
-const { triageRequest } = require('../services/aiTriageService');
+const { Counter } = require('../models/Counter');
+const KnowledgeBaseArticle = require('../models/KnowledgeBaseArticle');
+const AuditLog = require('../models/AuditLog');
 
 dotenv.config();
 
@@ -19,10 +21,16 @@ const seedData = async () => {
     await Ticket.deleteMany({});
     await Notification.deleteMany({});
     await Review.deleteMany({});
+    await Counter.deleteMany({});
+    await KnowledgeBaseArticle.deleteMany({});
+    await AuditLog.deleteMany({});
+
+    console.log('[Seeder] Initializing ticket sequence counter...');
+    await Counter.create({ _id: 'ticketNumber', seq: 1000 });
 
     console.log('[Seeder] Creating users...');
 
-    // 1. Single System Admin
+    // 1. Single System Admin (Explicitly Requested: abiha@gmail.com / 12345678)
     const admin = await User.create({
       name: 'Abiha',
       email: 'abiha@gmail.com',
@@ -91,51 +99,120 @@ const seedData = async () => {
       isActive: true,
     });
 
+    console.log('[Seeder] Creating Knowledge Base articles...');
+    await KnowledgeBaseArticle.insertMany([
+      {
+        title: 'How to Reset Your Account Password and Enable 2FA',
+        slug: 'how-to-reset-password-and-enable-2fa',
+        category: 'Account',
+        content: `If you forget your password, click the "Forgot Password?" link on the Sign In page. A cryptographically secure 6-digit verification code will be dispatched to your registered email address.\n\nEnter the 6-digit code within 10 minutes to verify your identity, then define a new strong password (minimum 6 characters).\n\nFor enhanced account protection, keep your credentials confidential and change your password periodically.`,
+        tags: ['password', 'account', 'security', 'otp', 'reset'],
+        published: true,
+        viewCount: 142,
+        helpfulCount: 38,
+        author: admin._id,
+      },
+      {
+        title: 'Understanding Billing Cycles, Invoices, and Payment Methods',
+        slug: 'understanding-billing-cycles-and-invoices',
+        category: 'Billing',
+        content: `SupportFlow invoices are generated automatically at the beginning of each billing cycle.\n\nAccepted payment methods include major credit cards (Visa, MasterCard, American Express) and corporate bank transfers. If your transaction fails, verify that your card has international transactions enabled and retry. Invoices can be downloaded as PDF receipts at any time.`,
+        tags: ['billing', 'invoice', 'payment', 'credit card'],
+        published: true,
+        viewCount: 89,
+        helpfulCount: 24,
+        author: admin._id,
+      },
+      {
+        title: 'Troubleshooting High Latency, VPN Disconnections, and Network Timeouts',
+        slug: 'troubleshooting-high-latency-and-vpn',
+        category: 'Network',
+        content: `If you experience network drops or slow response times:\n1. Run a traceroute test to verify where packet loss occurs.\n2. Ensure your local firewall allows UDP traffic on standard VPN gateway ports.\n3. Flush your DNS cache by running 'ipconfig /flushdns' in Command Prompt or Terminal.\n4. If connectivity issues persist, submit a Critical priority support request for immediate SLA routing.`,
+        tags: ['network', 'vpn', 'latency', 'ping', 'dns'],
+        published: true,
+        viewCount: 215,
+        helpfulCount: 76,
+        author: worker2._id,
+      },
+      {
+        title: 'Diagnosing Hardware & Peripheral Connection Errors',
+        slug: 'diagnosing-hardware-and-peripheral-errors',
+        category: 'Hardware',
+        content: `When external monitors, audio devices, or docking stations fail to register:\n1. Check physical cable connections and power adapters.\n2. Verify device manager drivers for yellow warning exclamation marks.\n3. Disconnect other USB peripherals to test power load balance.\n4. Contact on-site engineering with device serial numbers for replacement.`,
+        tags: ['hardware', 'monitor', 'docking', 'cables', 'device'],
+        published: true,
+        viewCount: 65,
+        helpfulCount: 19,
+        author: worker1._id,
+      },
+      {
+        title: 'Resolving Application Crashes and 500 Server Errors',
+        slug: 'resolving-application-crashes-and-500-errors',
+        category: 'Technical Support',
+        content: `Encountering an unexpected error code or blank screen?\n1. Clear your browser cache and cookies.\n2. Verify that you are running the latest version of Chrome, Firefox, or Safari.\n3. Check system status notifications for scheduled maintenance.\n4. Attach screenshots or error codes when submitting a support ticket to expedite resolution.`,
+        tags: ['bug', 'crash', '500', 'error', 'browser'],
+        published: true,
+        viewCount: 178,
+        helpfulCount: 52,
+        author: admin._id,
+      },
+    ]);
+
     console.log('[Seeder] Creating sample tickets and conversations...');
 
-    // Ticket 1: Resolved with review
-    const t1Subject = 'Cannot process enterprise invoice payments with Stripe gateway';
-    const t1Desc =
-      'Our monthly billing renewal failed this morning. Customers are seeing a payment gateway error 500 when attempting to update credit card details.';
-    const t1Ai = triageRequest(t1Subject, t1Desc);
-
+    // Ticket 1: Resolved with 5-Star Review
     const ticket1 = await Ticket.create({
       ticketNumber: 'SF-1001',
       customer: customer1._id,
       assignedWorker: worker1._id,
-      subject: t1Subject,
-      description: t1Desc,
-      category: t1Ai.category,
-      priority: 'High',
+      subject: 'Critical: Payment gateway timeout during client checkout',
+      description:
+        'When clients attempt to check out with Stripe, the payment modal spins indefinitely and times out after 45 seconds.',
+      category: 'Billing',
+      priority: 'Critical',
       status: 'Resolved',
-      aiTriage: t1Ai,
-      acceptedAt: new Date(Date.now() - 3600000 * 24),
-      resolvedAt: new Date(Date.now() - 3600000 * 4),
+      aiTriage: {
+        category: 'Billing',
+        priority: 'Critical',
+        summary: 'Critical payment gateway checkout timeout triaged with Critical priority.',
+        confidence: 0.95,
+        confidenceLabel: 'High Confidence',
+        suggestedActions: [
+          'Immediate 15-minute SLA escalation triggered.',
+          'Verify webhook delivery status and Stripe API logs.',
+          'Restart payment microservice gateway.',
+        ],
+      },
+      slaDeadline: new Date(Date.now() - 2 * 60 * 60 * 1000),
+      slaFirstResponseAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+      slaStatus: 'SLA Met',
+      acceptedAt: new Date(Date.now() - 4 * 60 * 60 * 1000),
+      resolvedAt: new Date(Date.now() - 1 * 60 * 60 * 1000),
       hasReview: true,
       statusHistory: [
         {
           status: 'Pending',
           changedBy: customer1._id,
           note: 'Request created by customer.',
-          changedAt: new Date(Date.now() - 3600000 * 25),
+          changedAt: new Date(Date.now() - 4.5 * 60 * 60 * 1000),
         },
         {
           status: 'Accepted',
           changedBy: worker1._id,
-          note: 'Accepted by Alex Taylor',
-          changedAt: new Date(Date.now() - 3600000 * 24),
+          note: 'Accepted by Worker Alex Taylor',
+          changedAt: new Date(Date.now() - 4 * 60 * 60 * 1000),
         },
         {
           status: 'In Progress',
           changedBy: worker1._id,
-          note: 'Investigating Stripe API webhook logs',
-          changedAt: new Date(Date.now() - 3600000 * 12),
+          note: 'Investigating webhook certificates and timeout settings.',
+          changedAt: new Date(Date.now() - 3.5 * 60 * 60 * 1000),
         },
         {
           status: 'Resolved',
           changedBy: worker1._id,
-          note: 'Webhook TLS certificate updated and failing payment retry queue cleared.',
-          changedAt: new Date(Date.now() - 3600000 * 4),
+          note: 'Updated webhook TLS cipher configuration. Verified 5 successful checkout test runs.',
+          changedAt: new Date(Date.now() - 1 * 60 * 60 * 1000),
         },
       ],
       messages: [
@@ -143,176 +220,174 @@ const seedData = async () => {
           sender: customer1._id,
           senderRole: 'customer',
           senderName: 'Emily Watson',
-          text: 'Hi Alex, any update on the Stripe gateway issues? We have pending transactions.',
-          createdAt: new Date(Date.now() - 3600000 * 10),
+          text: 'Hi Alex, checkout is completely blocked for our European customers. Any updates?',
+          createdAt: new Date(Date.now() - 3.8 * 60 * 60 * 1000),
         },
         {
           sender: worker1._id,
           senderRole: 'worker',
           senderName: 'Alex Taylor',
-          text: 'Hello Emily! I found the expired webhook certificate and rotated it. The retry queue is now executing cleanly.',
-          createdAt: new Date(Date.now() - 3600000 * 5),
+          text: 'Hello Emily! I am reviewing the webhook gateway logs right now. Found a TLS negotiation timeout. Deploying fix now.',
+          createdAt: new Date(Date.now() - 3.5 * 60 * 60 * 1000),
         },
         {
-          sender: customer1._id,
-          senderRole: 'customer',
-          senderName: 'Emily Watson',
-          text: 'All transactions went through! Thank you so much for the swift resolution.',
-          createdAt: new Date(Date.now() - 3600000 * 4),
+          sender: worker1._id,
+          senderRole: 'worker',
+          senderName: 'Alex Taylor',
+          text: 'Fix is deployed! Transactions are passing cleanly with <200ms latency. Marking this resolved.',
+          createdAt: new Date(Date.now() - 1 * 60 * 60 * 1000),
         },
       ],
     });
 
-    // Review for Ticket 1
+    // Review on Ticket 1
     await Review.create({
       ticket: ticket1._id,
       customer: customer1._id,
       worker: worker1._id,
       rating: 5,
-      comment:
-        'Alex was extremely fast and resolved our payment gateway issue in no time. Top tier support!',
+      comment: 'Incredible response time! Alex diagnosed the TLS handshake issue within minutes and saved our weekend launch.',
     });
 
     // Ticket 2: In Progress
-    const t2Subject = 'Database connection timeout in production cluster';
-    const t2Desc =
-      'Our primary MongoDB replica set is rejecting incoming connections during peak traffic spikes. We are experiencing production downtime.';
-    const t2Ai = triageRequest(t2Subject, t2Desc);
-
-    await Ticket.create({
+    const ticket2 = await Ticket.create({
       ticketNumber: 'SF-1002',
       customer: customer2._id,
-      assignedWorker: worker1._id,
-      subject: t2Subject,
-      description: t2Desc,
-      category: t2Ai.category,
-      priority: 'Critical',
+      assignedWorker: worker2._id,
+      subject: 'Office VPN disconnecting every 10 minutes on macOS Sequoia',
+      description:
+        'All team members on macOS Sequoia experience abrupt VPN disconnects every 10-15 minutes.',
+      category: 'Network',
+      priority: 'High',
       status: 'In Progress',
-      aiTriage: t2Ai,
-      acceptedAt: new Date(Date.now() - 3600000 * 2),
+      aiTriage: {
+        category: 'Network',
+        priority: 'High',
+        summary: 'VPN stability and disconnect issue triaged with High priority.',
+        confidence: 0.92,
+        confidenceLabel: 'High Confidence',
+        suggestedActions: [
+          'Verify IKEv2 keep-alive handshake timers.',
+          'Issue updated WireGuard configuration profile.',
+        ],
+      },
+      slaDeadline: new Date(Date.now() + 90 * 60 * 1000),
+      slaFirstResponseAt: new Date(Date.now() - 30 * 60 * 1000),
+      slaStatus: 'Within SLA',
+      acceptedAt: new Date(Date.now() - 45 * 60 * 1000),
       statusHistory: [
         {
           status: 'Pending',
           changedBy: customer2._id,
-          note: 'Request created',
-          changedAt: new Date(Date.now() - 3600000 * 3),
-        },
-        {
-          status: 'Accepted',
-          changedBy: worker1._id,
-          note: 'Accepted by Alex Taylor',
-          changedAt: new Date(Date.now() - 3600000 * 2),
-        },
-        {
-          status: 'In Progress',
-          changedBy: worker1._id,
-          note: 'Analyzing pool connection metrics and indexing bottlenecks.',
-          changedAt: new Date(Date.now() - 3600000 * 1),
-        },
-      ],
-      messages: [
-        {
-          sender: worker1._id,
-          senderRole: 'worker',
-          senderName: 'Alex Taylor',
-          text: 'I am reviewing the active query telemetry. Increasing connection pool limit temporarily.',
-          createdAt: new Date(Date.now() - 3600000 * 1),
-        },
-      ],
-    });
-
-    // Ticket 3: Accepted
-    const t3Subject = 'VPN gateway unreachable after router firmware update';
-    const t3Desc =
-      'Remote employees in Europe are unable to connect to the internal VPN gateway since 08:00 AM.';
-    const t3Ai = triageRequest(t3Subject, t3Desc);
-
-    await Ticket.create({
-      ticketNumber: 'SF-1003',
-      customer: customer1._id,
-      assignedWorker: worker2._id,
-      subject: t3Subject,
-      description: t3Desc,
-      category: t3Ai.category,
-      priority: 'Urgent',
-      status: 'Accepted',
-      aiTriage: t3Ai,
-      acceptedAt: new Date(Date.now() - 3600000 * 1),
-      statusHistory: [
-        {
-          status: 'Pending',
-          changedBy: customer1._id,
-          note: 'Created',
-          changedAt: new Date(Date.now() - 3600000 * 2),
+          note: 'Request created.',
+          changedAt: new Date(Date.now() - 60 * 60 * 1000),
         },
         {
           status: 'Accepted',
           changedBy: worker2._id,
-          note: 'Accepted by Sarah Jenkins',
-          changedAt: new Date(Date.now() - 3600000 * 1),
+          note: 'Accepted by Worker Sarah Jenkins',
+          changedAt: new Date(Date.now() - 45 * 60 * 1000),
         },
-      ],
-    });
-
-    // Ticket 4: Pending in available pool
-    const t4Subject = 'Dual monitor flicker on USB-C docking station';
-    const t4Desc =
-      'Whenever connecting 4K secondary displays via DisplayPort on the new Dell dock, the left screen periodically turns black.';
-    const t4Ai = triageRequest(t4Subject, t4Desc);
-
-    await Ticket.create({
-      ticketNumber: 'SF-1004',
-      customer: customer2._id,
-      assignedWorker: null,
-      subject: t4Subject,
-      description: t4Desc,
-      category: t4Ai.category,
-      priority: 'Medium',
-      status: 'Pending',
-      aiTriage: t4Ai,
-      statusHistory: [
         {
-          status: 'Pending',
-          changedBy: customer2._id,
-          note: 'Awaiting worker review',
-          changedAt: new Date(Date.now() - 3600000 * 4),
+          status: 'In Progress',
+          changedBy: worker2._id,
+          note: 'Diagnosing WireGuard handshake packet renegotiation parameters.',
+          changedAt: new Date(Date.now() - 35 * 60 * 1000),
+        },
+      ],
+      messages: [
+        {
+          sender: customer2._id,
+          senderRole: 'customer',
+          senderName: 'Michael Chang',
+          text: 'Hi Sarah, it happens on both Wi-Fi and Ethernet connections.',
+          createdAt: new Date(Date.now() - 35 * 60 * 1000),
+        },
+        {
+          sender: worker2._id,
+          senderRole: 'worker',
+          senderName: 'Sarah Jenkins',
+          text: 'Thanks Michael! Apple updated MTU handling in 15.1. I am preparing a revised profile with MTU 1380.',
+          createdAt: new Date(Date.now() - 30 * 60 * 1000),
         },
       ],
     });
 
-    // Ticket 5: Pending in available pool
-    const t5Subject = 'Request 2FA authenticator reset for locked account';
-    const t5Desc =
-      'I lost my phone over the weekend and cannot receive authentication codes to access my account dashboard.';
-    const t5Ai = triageRequest(t5Subject, t5Desc);
-
-    await Ticket.create({
-      ticketNumber: 'SF-1005',
+    // Ticket 3: Pending in Available Pool
+    const ticket3 = await Ticket.create({
+      ticketNumber: 'SF-1003',
       customer: customer1._id,
       assignedWorker: null,
-      subject: t5Subject,
-      description: t5Desc,
-      category: t5Ai.category,
-      priority: 'High',
+      subject: 'Request for secondary monitor and 4K docking hub setup',
+      description:
+        'Need assistance configuring dual 4K external displays via Thunderbolt dock with display calibration.',
+      category: 'Hardware',
+      priority: 'Medium',
       status: 'Pending',
-      aiTriage: t5Ai,
+      aiTriage: {
+        category: 'Hardware',
+        priority: 'Medium',
+        summary: 'Dual display hardware setup triaged with Medium priority.',
+        confidence: 0.88,
+        confidenceLabel: 'Medium Confidence',
+        suggestedActions: [
+          'Verify DisplayPort 1.4 MST support on target graphics card.',
+          'Provide standardized docking station setup guide.',
+        ],
+      },
+      slaDeadline: new Date(Date.now() + 6 * 60 * 60 * 1000),
+      slaStatus: 'Within SLA',
       statusHistory: [
         {
           status: 'Pending',
           changedBy: customer1._id,
-          note: 'Awaiting worker review',
-          changedAt: new Date(Date.now() - 3600000 * 5),
+          note: 'Request placed in Available pool.',
+          changedAt: new Date(Date.now() - 20 * 60 * 1000),
         },
       ],
+      messages: [],
     });
 
-    // Sample Notifications
-    await Notification.create([
+    // Audit Logs
+    await AuditLog.insertMany([
+      {
+        actor: admin._id,
+        actorRole: 'admin',
+        action: 'SYSTEM_INITIALIZED',
+        target: 'SupportFlow v2.0',
+        targetType: 'System',
+        metadata: { version: '2.0.0', architecture: 'Pure REST' },
+      },
+      {
+        actor: admin._id,
+        actorRole: 'admin',
+        action: 'WORKER_APPROVED',
+        target: worker1.email,
+        targetType: 'User',
+      },
+      {
+        actor: admin._id,
+        actorRole: 'admin',
+        action: 'WORKER_APPROVED',
+        target: worker2.email,
+        targetType: 'User',
+      },
+      {
+        actor: customer1._id,
+        actorRole: 'customer',
+        action: 'TICKET_CREATED',
+        target: 'SF-1001',
+        targetType: 'Ticket',
+      },
+    ]);
+
+    // Initial Notifications
+    await Notification.insertMany([
       {
         recipient: admin._id,
         type: 'worker_applied',
         title: 'New Worker Application',
-        message: 'David Vance (worker.pending@supportflow.com) registered as a Worker and is pending approval.',
+        message: 'David Vance (worker.pending@supportflow.com) submitted a Worker application awaiting review.',
         link: '/admin/workers',
         isRead: false,
       },
@@ -320,8 +395,8 @@ const seedData = async () => {
         recipient: customer1._id,
         ticket: ticket1._id,
         type: 'ticket_resolved',
-        title: 'Request Resolved',
-        message: 'Your request "Cannot process enterprise invoice payments" was resolved. Thank you for your review!',
+        title: 'Request Completed & Resolved',
+        message: 'Your request SF-1001 has been resolved by Alex Taylor. Please rate your service experience!',
         link: `/customer/requests/${ticket1._id}`,
         isRead: true,
       },
@@ -339,12 +414,12 @@ const seedData = async () => {
     console.log('\n======================================================');
     console.log(' ✨ SupportFlow Database Seed Completed Successfully!');
     console.log('======================================================');
-    console.log(' Demo Accounts Created:');
-    console.log('   👤 Admin (Single):   abiha@gmail.com (Password: 12345678)');
-    console.log('   🛠️  Worker (Approved): worker1@supportflow.com (Password: Password@123)');
-    console.log('   🛠️  Worker (Approved): worker2@supportflow.com (Password: Password@123)');
-    console.log('   ⏳ Worker (Pending):  worker.pending@supportflow.com (Password: Password@123)');
-    console.log('   🚫 Worker (Rejected): worker.rejected@supportflow.com (Password: Password@123)');
+    console.log(' Demo Accounts:');
+    console.log('   👤 Single Admin:      abiha@gmail.com (Password: 12345678)');
+    console.log('   🛠️  Approved Worker 1: worker1@supportflow.com (Password: Password@123)');
+    console.log('   🛠️  Approved Worker 2: worker2@supportflow.com (Password: Password@123)');
+    console.log('   ⏳ Pending Worker:    worker.pending@supportflow.com (Password: Password@123)');
+    console.log('   🚫 Rejected Worker:   worker.rejected@supportflow.com (Password: Password@123)');
     console.log('   🙋 Customer 1:        customer1@supportflow.com (Password: Password@123)');
     console.log('   🙋 Customer 2:        customer2@supportflow.com (Password: Password@123)');
     console.log('======================================================\n');

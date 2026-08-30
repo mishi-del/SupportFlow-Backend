@@ -5,10 +5,21 @@ const errorHandler = (err, req, res, next) => {
   let error = { ...err };
   error.message = err.message;
 
-  // Log to console for debugging in development
-  if (process.env.NODE_ENV !== 'test') {
+  const isProduction = process.env.NODE_ENV === 'production';
+
+  // Log error for debugging in development/non-prod
+  if (!isProduction) {
     console.error(`[Error] ${err.name || 'Server Error'}: ${err.message}`);
     if (err.stack) console.error(err.stack);
+  }
+
+  // Multer upload errors
+  if (err.name === 'MulterError') {
+    return res.status(400).json({
+      success: false,
+      message: `File upload error: ${err.message}`,
+      code: 'FILE_UPLOAD_ERROR',
+    });
   }
 
   // Mongoose bad ObjectId (CastError)
@@ -17,18 +28,18 @@ const errorHandler = (err, req, res, next) => {
     return res.status(404).json({
       success: false,
       message,
-      errors: [message],
+      code: 'RESOURCE_NOT_FOUND',
     });
   }
 
   // Mongoose duplicate key error (code 11000)
   if (err.code === 11000) {
-    const field = Object.keys(err.keyValue)[0];
+    const field = Object.keys(err.keyValue || {})[0] || 'field';
     const message = `Duplicate value entered for '${field}'. This value already exists.`;
     return res.status(400).json({
       success: false,
       message,
-      errors: [message],
+      code: 'DUPLICATE_ENTRY',
     });
   }
 
@@ -37,8 +48,9 @@ const errorHandler = (err, req, res, next) => {
     const messages = Object.values(err.errors).map((val) => val.message);
     return res.status(400).json({
       success: false,
-      message: 'Validation failed',
+      message: messages[0] || 'Validation failed',
       errors: messages,
+      code: 'VALIDATION_ERROR',
     });
   }
 
@@ -47,22 +59,22 @@ const errorHandler = (err, req, res, next) => {
     return res.status(401).json({
       success: false,
       message: 'Invalid authorization token',
-      errors: ['Invalid token'],
+      code: 'TOKEN_INVALID',
     });
   }
 
   if (err.name === 'TokenExpiredError') {
     return res.status(401).json({
       success: false,
-      message: 'Authorization token has expired',
-      errors: ['Token expired'],
+      message: 'Authorization token has expired. Please log in again.',
+      code: 'TOKEN_EXPIRED',
     });
   }
 
   res.status(error.statusCode || 500).json({
     success: false,
     message: error.message || 'Internal Server Error',
-    errors: error.errors || [error.message || 'An unexpected error occurred'],
+    code: error.code || 'SERVER_ERROR',
   });
 };
 

@@ -4,23 +4,34 @@ const {
   createTicket,
   getTickets,
   getTicketById,
+  closeTicket,
+  reopenTicket,
+  escalateTicket,
+  getTicketMessages,
   addMessage,
 } = require('../controllers/ticketController');
-const {
-  submitReview,
-  getTicketReview,
-} = require('../controllers/reviewController');
 const { protect, authorize } = require('../middleware/auth');
+const { apiWriteLimiter } = require('../middleware/rateLimiter');
+const upload = require('../middleware/upload');
 
+// Base tickets router
 router.use(protect);
 
 router
   .route('/')
-  .post(authorize('customer'), createTicket)
-  .get(getTickets);
+  .get(getTickets)
+  .post(authorize('customer', 'admin'), apiWriteLimiter, upload.array('attachments', 3), createTicket);
 
 router.route('/:id').get(getTicketById);
-router.route('/:id/messages').post(addMessage);
-router.route('/:id/review').post(authorize('customer'), submitReview).get(getTicketReview);
+
+router.put('/:id/close', closeTicket);
+router.put('/:id/reopen', authorize('customer', 'admin'), reopenTicket);
+router.post('/:id/escalate', authorize('worker', 'admin'), escalateTicket);
+
+// Ticket Messages
+router
+  .route('/:id/messages')
+  .get(getTicketMessages)
+  .post(apiWriteLimiter, upload.array('attachments', 3), addMessage);
 
 module.exports = router;

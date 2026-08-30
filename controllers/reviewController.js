@@ -1,100 +1,122 @@
-const mongoose = require('mongoose');
 const Review = require('../models/Review');
 const Ticket = require('../models/Ticket');
-const {
-  createAndSendNotification,
-  broadcastSocketEvent,
-} = require('../services/notificationService');
+const { createAndSendNotification } = require('../services/notificationService');
+const { logAuditEvent } = require('../services/auditService');
 
 /**
- * @desc    Submit a 5-star review for a completed/resolved ticket (Customer only)
- * @route   POST /api/tickets/:id/review
+ * @desc    Submit a 5-star review on a resolved request (Customer only)
+ * @route   POST /api/reviews
  * @access  Private (Customer)
  */
-exports.submitReview = async (req, res, next) => {
+exports.createReview = async (req, res, next) => {
   try {
-    const { rating, comment = '' } = req.body;
-    const ticketId = req.params.id;
+    const { ticketId, rating, comment = '' } = req.body;
 
-    if (!rating || rating < 1 || rating > 5 || !Number.isInteger(Number(rating))) {
+    if (!ticketId || rating === undefined) {
       return res.status(400).json({
         success: false,
-        message: 'Rating must be an integer between 1 and 5 stars',
-        errors: ['Rating is required and must be between 1 and 5'],
+        message: 'Ticket ID and star rating (1-5) are required',
+        code: 'MISSING_FIELDS',
       });
     }
 
-    const ticket = await Ticket.findById(ticketId).populate('assignedWorker', 'name email');
+    const ratingNum = parseInt(rating, 10);
+    if (isNaN(ratingNum) || ratingNum < 1 || ratingNum > 5) {
+      return res.status(400).json({
+        success: false,
+        message: 'Star rating must be an integer between 1 and 5',
+        code: 'INVALID_RATING',
+      });
+    }
+
+    if (comment && comment.trim().length > 1000) {
+      return res.status(400).json({
+        success: false,
+        message: 'Comment cannot exceed 1000 characters',
+        code: 'COMMENT_TOO_LONG',
+      });
+    }
+
+    const ticket = await Ticket.findById(ticketId);
 
     if (!ticket) {
       return res.status(404).json({
         success: false,
         message: 'Request not found',
+        code: 'TICKET_NOT_FOUND',
       });
     }
 
-    // Only the ticket owner can review
+    // Customer ownership validation
     if (ticket.customer.toString() !== req.user._id.toString()) {
       return res.status(403).json({
         success: false,
-        message: 'Forbidden: You can only review your own requests.',
+        message: 'Forbidden: You can only review requests submitted by your account.',
+        code: 'FORBIDDEN',
       });
     }
 
-    // Only resolved requests can be reviewed
-    if (ticket.status !== 'Resolved') {
+    // Must be in Resolved or Closed status
+    if (ticket.status !== 'Resolved' && ticket.status !== 'Closed') {
       return res.status(400).json({
         success: false,
-        message: `Review not allowed before resolution. Current status is '${ticket.status}'.`,
-        errors: ['Request must be in Resolved status to submit a review'],
+        message: `Reviews can only be submitted for Resolved or Closed requests. Current status: '${ticket.status}'.`,
+        code: 'TICKET_NOT_RESOLVED',
       });
     }
 
     if (!ticket.assignedWorker) {
       return res.status(400).json({
         success: false,
-        message: 'Cannot submit review for a request without an assigned worker.',
+        message: 'Cannot review a request with no assigned worker.',
+        code: 'NO_ASSIGNED_WORKER',
       });
     }
 
-    // Check if review already exists
-    const existingReview = await Review.findOne({ ticket: ticket._id });
-    if (existingReview || ticket.hasReview) {
+    // Check for existing review (enforced by DB unique index as well)
+    const existingReview = await Review.findOne({ ticket: ticketId });
+    if (existingReview) {
       return res.status(400).json({
         success: false,
-        message: 'A review has already been submitted for this request.',
-        errors: ['Duplicate review not allowed'],
+        message: 'A review has already been submitted for this request. Reviews cannot be submitted twice.',
+        code: 'DUPLICATE_REVIEW',
       });
     }
 
     const review = await Review.create({
       ticket: ticket._id,
       customer: req.user._id,
-      worker: ticket.assignedWorker._id,
-      rating: Number(rating),
+      worker: ticket.assignedWorker,
+      rating: ratingNum,
       comment: comment.trim(),
     });
 
     ticket.hasReview = true;
     await ticket.save();
 
-    await review.populate('customer', 'name email');
-
-    // Notify Worker
+    // Create database notification for Worker
     await createAndSendNotification({
-      recipient: ticket.assignedWorker._id,
+      recipient: ticket.assignedWorker,
       ticket: ticket._id,
       type: 'review_submitted',
-      title: 'New Service Rating Received',
-      message: `${req.user.name} rated your service ${rating}/5 stars on request "${ticket.subject}" (${ticket.ticketNumber}).`,
-      link: `/worker/profile`,
+      title: 'New Customer Review Received',
+      message: `${req.user.name} rated your service ${ratingNum}/5 stars on request ${ticket.ticketNumber}.`,
+      link: '/worker/profile',
     });
 
-    broadcastSocketEvent(`ticket_${ticket._id}`, 'review-submitted', review);
+    await logAuditEvent({
+      actor: req.user._id,
+      actorRole: 'customer',
+      action: 'REVIEW_SUBMITTED',
+      target: ticket.ticketNumber,
+      targetType: 'Review',
+      metadata: { rating: ratingNum },
+      req,
+    });
 
     res.status(201).json({
       success: true,
-      message: 'Thank you! Your review and rating have been submitted.',
+      message: 'Review submitted successfully! Thank you for your feedback.',
       review,
     });
   } catch (err) {
@@ -103,96 +125,59 @@ exports.submitReview = async (req, res, next) => {
 };
 
 /**
- * @desc    Get reviews and aggregate statistics for a worker
- * @route   GET /api/workers/:id/reviews
+ * @desc    Get reviews and aggregate rating metrics for a worker
+ * @route   GET /api/reviews/worker/:workerId
  * @access  Private
  */
 exports.getWorkerReviews = async (req, res, next) => {
   try {
-    const workerId = req.params.id === 'me' ? req.user._id : req.params.id;
+    const workerId = req.params.workerId;
+    const { page = 1, limit = 20 } = req.query;
 
-    if (!mongoose.Types.ObjectId.isValid(workerId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid worker ID',
-      });
-    }
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+    const skip = (pageNum - 1) * limitNum;
 
-    const reviews = await Review.find({ worker: workerId })
-      .populate('customer', 'name email')
-      .populate('ticket', 'subject ticketNumber category')
-      .sort({ createdAt: -1 });
-
-    // Calculate dynamic rating aggregate directly from database
-    const aggregateResult = await Review.aggregate([
-      { $match: { worker: new mongoose.Types.ObjectId(workerId) } },
-      {
-        $group: {
-          _id: '$worker',
-          averageRating: { $avg: '$rating' },
-          totalReviews: { $sum: 1 },
-          star5Count: { $sum: { $cond: [{ $eq: ['$rating', 5] }, 1, 0] } },
-          star4Count: { $sum: { $cond: [{ $eq: ['$rating', 4] }, 1, 0] } },
-          star3Count: { $sum: { $cond: [{ $eq: ['$rating', 3] }, 1, 0] } },
-          star2Count: { $sum: { $cond: [{ $eq: ['$rating', 2] }, 1, 0] } },
-          star1Count: { $sum: { $cond: [{ $eq: ['$rating', 1] }, 1, 0] } },
-        },
-      },
+    const [total, reviews] = await Promise.all([
+      Review.countDocuments({ worker: workerId }),
+      Review.find({ worker: workerId })
+        .populate('customer', 'name')
+        .populate('ticket', 'ticketNumber subject')
+        .sort('-createdAt')
+        .skip(skip)
+        .limit(limitNum)
+        .lean(),
     ]);
 
-    const stats =
-      aggregateResult.length > 0
-        ? {
-            averageRating: Number(aggregateResult[0].averageRating.toFixed(1)),
-            totalReviews: aggregateResult[0].totalReviews,
-            breakdown: {
-              5: aggregateResult[0].star5Count,
-              4: aggregateResult[0].star4Count,
-              3: aggregateResult[0].star3Count,
-              2: aggregateResult[0].star2Count,
-              1: aggregateResult[0].star1Count,
-            },
-          }
-        : {
-            averageRating: 0,
-            totalReviews: 0,
-            breakdown: { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 },
-          };
+    // Aggregate statistics
+    const allWorkerReviews = await Review.find({ worker: workerId });
+    const count = allWorkerReviews.length;
+    const average =
+      count > 0
+        ? (allWorkerReviews.reduce((sum, r) => sum + r.rating, 0) / count).toFixed(1)
+        : '5.0';
 
-    res.status(200).json({
-      success: true,
-      stats,
-      count: reviews.length,
-      reviews,
+    const distribution = { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 };
+    allWorkerReviews.forEach((r) => {
+      if (distribution[r.rating] !== undefined) {
+        distribution[r.rating]++;
+      }
     });
-  } catch (err) {
-    next(err);
-  }
-};
-
-/**
- * @desc    Get review for a specific ticket
- * @route   GET /api/tickets/:id/review
- * @access  Private
- */
-exports.getTicketReview = async (req, res, next) => {
-  try {
-    const review = await Review.findOne({ ticket: req.params.id })
-      .populate('customer', 'name email')
-      .populate('worker', 'name email');
-
-    if (!review) {
-      return res.status(200).json({
-        success: true,
-        hasReview: false,
-        review: null,
-      });
-    }
 
     res.status(200).json({
       success: true,
-      hasReview: true,
-      review,
+      stats: {
+        averageRating: parseFloat(average),
+        totalReviews: count,
+        distribution,
+      },
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total,
+        pages: Math.ceil(total / limitNum) || 1,
+      },
+      reviews,
     });
   } catch (err) {
     next(err);
