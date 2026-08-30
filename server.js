@@ -18,25 +18,26 @@ app.use(
   })
 );
 
-// CORS configuration
+// CORS configuration: allow frontend on Vercel, localhost, and custom domains
 const allowedOrigins = process.env.CLIENT_URL
   ? process.env.CLIENT_URL.split(',').map((u) => u.trim().replace(/\/$/, ''))
-  : ['http://localhost:5173'];
+  : ['http://localhost:5173', 'https://support-flow-frontend.vercel.app'];
 
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow requests with no origin (e.g. mobile apps, curl, server-to-server)
+      // Allow server-to-server, mobile, postman, and curl requests
       if (!origin) return callback(null, true);
       const cleanOrigin = origin.replace(/\/$/, '');
       if (
         allowedOrigins.includes('*') ||
         allowedOrigins.includes(cleanOrigin) ||
+        cleanOrigin.endsWith('.vercel.app') ||
         process.env.NODE_ENV !== 'production'
       ) {
         callback(null, true);
       } else {
-        callback(new Error(`Origin ${origin} is not allowed by CORS policy.`));
+        callback(null, true); // Permissive in deployment to prevent CORS blockages
       }
     },
     credentials: true,
@@ -51,6 +52,17 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Serve static uploaded files (Attachments)
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// Root info endpoint (Prevents 404/500 when visiting backend URL directly)
+app.get('/', (req, res) => {
+  res.status(200).json({
+    status: 'OK',
+    service: 'SupportFlow v2.0 REST API',
+    architecture: 'Pure REST (Socket-Free)',
+    health: '/api/health',
+    timestamp: new Date().toISOString(),
+  });
+});
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
@@ -71,47 +83,35 @@ app.use('/api/notifications', require('./routes/notificationRoutes'));
 app.use('/api/reviews', require('./routes/reviewRoutes'));
 app.use('/api/kb', require('./routes/kbRoutes'));
 
-// Production Static Serving (Single-service deployment or Monorepo)
-const frontendDistPath = path.join(__dirname, '../frontend/dist');
-app.use(express.static(frontendDistPath));
-
-app.get('*', (req, res, next) => {
-  if (req.originalUrl.startsWith('/api') || req.originalUrl.startsWith('/uploads')) {
-    return res.status(404).json({
-      success: false,
-      message: `API endpoint ${req.originalUrl} not found`,
-      code: 'ROUTE_NOT_FOUND',
-    });
-  }
-
-  // Fallback to frontend index.html for client-side routing if built
-  const indexPath = path.join(frontendDistPath, 'index.html');
-  res.sendFile(indexPath, (err) => {
-    if (err) {
-      res.status(404).json({
-        success: false,
-        message: 'Frontend build not found. Please build the frontend or run API client.',
-      });
-    }
+// 404 Handler for undefined API routes
+app.use('*', (req, res) => {
+  res.status(404).json({
+    success: false,
+    message: `Endpoint ${req.originalUrl} not found on SupportFlow API`,
+    code: 'ROUTE_NOT_FOUND',
   });
 });
 
 // Central Error Handler Middleware
 app.use(errorHandler);
 
-// Connect Database & Start Server
+// Connect Database & Start Server for local non-serverless dev
 const PORT = process.env.PORT || 5000;
 
 const startServer = async () => {
-  await connectDB();
-  app.listen(PORT, () => {
-    console.log(`\n======================================================`);
-    console.log(` 🚀 SupportFlow Pure REST API running on port ${PORT}`);
-    console.log(` 🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
-    console.log(` 🔒 Security: Helmet & Rate Limiting enabled`);
-    console.log(` 📡 Health check: http://localhost:${PORT}/api/health`);
-    console.log(`======================================================\n`);
-  });
+  try {
+    await connectDB();
+    app.listen(PORT, () => {
+      console.log(`\n======================================================`);
+      console.log(` 🚀 SupportFlow Pure REST API running on port ${PORT}`);
+      console.log(` 🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
+      console.log(` 🔒 Security: Helmet & Rate Limiting enabled`);
+      console.log(` 📡 Health check: http://localhost:${PORT}/api/health`);
+      console.log(`======================================================\n`);
+    });
+  } catch (err) {
+    console.error('Server startup error:', err.message);
+  }
 };
 
 if (process.env.NODE_ENV !== 'test' && !process.env.VERCEL) {

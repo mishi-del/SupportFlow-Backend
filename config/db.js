@@ -1,51 +1,45 @@
 const mongoose = require('mongoose');
 
-let mongoServer;
+let isConnected = false;
 
 const connectDB = async () => {
-  const isProduction = process.env.NODE_ENV === 'production';
-  const uri = process.env.MONGO_URI;
-
-  if (isProduction && !uri) {
-    console.error(' [CRITICAL ERROR] MONGO_URI is missing in production environment variables.');
-    process.exit(1);
+  // If already connected in this serverless execution context, reuse it
+  if (mongoose.connection.readyState >= 1) {
+    return mongoose.connection;
   }
 
-  const targetUri = uri || 'mongodb://localhost:27017/supportflow';
+  const isServerless = Boolean(process.env.VERCEL);
+  const uri = process.env.MONGO_URI;
+
+  if (!uri) {
+    const errorMsg = 'MONGO_URI is missing in environment variables. Please add MONGO_URI in Vercel Project Settings > Environment Variables.';
+    console.error(`[MongoDB Error] ${errorMsg}`);
+    if (!isServerless && process.env.NODE_ENV === 'production') {
+      process.exit(1);
+    }
+    throw new Error(errorMsg);
+  }
 
   try {
-    const conn = await mongoose.connect(targetUri, {
-      serverSelectionTimeoutMS: 5000,
+    const conn = await mongoose.connect(uri, {
+      serverSelectionTimeoutMS: 7000,
     });
+    isConnected = true;
     console.log(`[MongoDB] Connected successfully: ${conn.connection.host}`);
+    return conn;
   } catch (err) {
-    console.error(`[MongoDB] Connection error to ${targetUri}: ${err.message}`);
-
-    if (isProduction) {
-      console.error(' [FATAL] Production database connection failed. Refusing to start with in-memory database. Exiting process safely.');
+    console.error(`[MongoDB] Connection error: ${err.message}`);
+    if (!isServerless && process.env.NODE_ENV === 'production') {
       process.exit(1);
     }
-
-    // In development or test environments only: fallback to in-memory server
-    console.warn('[MongoDB] (Development Mode) Initializing in-memory MongoDB server as fallback...');
-    try {
-      const { MongoMemoryServer } = require('mongodb-memory-server');
-      mongoServer = await MongoMemoryServer.create();
-      const memoryUri = mongoServer.getUri();
-      const conn = await mongoose.connect(memoryUri);
-      console.log(`[MongoDB] In-Memory server running at: ${memoryUri}`);
-    } catch (memErr) {
-      console.error('[MongoDB] Failed to start in-memory server:', memErr.message);
-      process.exit(1);
-    }
+    throw err;
   }
 };
 
 const disconnectDB = async () => {
   try {
-    await mongoose.disconnect();
-    if (mongoServer) {
-      await mongoServer.stop();
+    if (mongoose.connection.readyState !== 0) {
+      await mongoose.disconnect();
     }
   } catch (err) {
     console.error('[MongoDB] Error disconnecting DB:', err.message);
