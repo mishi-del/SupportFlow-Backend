@@ -18,27 +18,12 @@ app.use(
   })
 );
 
-// CORS configuration: allow frontend on Vercel, localhost, and custom domains
-const allowedOrigins = process.env.CLIENT_URL
-  ? process.env.CLIENT_URL.split(',').map((u) => u.trim().replace(/\/$/, ''))
-  : ['http://localhost:5173', 'https://support-flow-frontend.vercel.app'];
-
+// Permissive CORS for Vercel, localhost, and custom domains
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow server-to-server, mobile, postman, and curl requests
-      if (!origin) return callback(null, true);
-      const cleanOrigin = origin.replace(/\/$/, '');
-      if (
-        allowedOrigins.includes('*') ||
-        allowedOrigins.includes(cleanOrigin) ||
-        cleanOrigin.endsWith('.vercel.app') ||
-        process.env.NODE_ENV !== 'production'
-      ) {
-        callback(null, true);
-      } else {
-        callback(null, true); // Permissive in deployment to prevent CORS blockages
-      }
+      // Allow requests from all origins in cloud serverless deployment
+      callback(null, true);
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
@@ -53,7 +38,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Serve static uploaded files (Attachments)
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Root info endpoint (Prevents 404/500 when visiting backend URL directly)
+// Root info endpoint (Never crashes, immediate 200 JSON)
 app.get('/', (req, res) => {
   res.status(200).json({
     status: 'OK',
@@ -74,6 +59,21 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// DB Connection middleware: safely connect on-demand for serverless functions
+app.use(async (req, res, next) => {
+  try {
+    await connectDB();
+    next();
+  } catch (err) {
+    console.error('[DB Middleware Error]:', err.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Database connection failed. Please ensure MONGO_URI is configured in Vercel Environment Variables.',
+      error: err.message,
+    });
+  }
+});
+
 // Mount REST API Routes
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/tickets', require('./routes/ticketRoutes'));
@@ -83,7 +83,7 @@ app.use('/api/notifications', require('./routes/notificationRoutes'));
 app.use('/api/reviews', require('./routes/reviewRoutes'));
 app.use('/api/kb', require('./routes/kbRoutes'));
 
-// 404 Handler for undefined API routes
+// 404 Handler for undefined routes
 app.use('*', (req, res) => {
   res.status(404).json({
     success: false,
