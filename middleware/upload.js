@@ -3,8 +3,13 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 
-// Ensure upload directory exists
-const uploadDir = path.join(__dirname, '../uploads');
+// Vercel serverless functions have a writable /tmp directory, while the
+// deployed application bundle is not a suitable place for runtime uploads.
+// Keep the normal uploads folder for local development.
+const uploadDir = process.env.VERCEL
+  ? path.join('/tmp', 'supportflow-uploads')
+  : path.join(__dirname, '../uploads');
+
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }
@@ -42,7 +47,7 @@ const fileFilter = (req, file, cb) => {
 const upload = multer({
   storage: storage,
   limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB limit
+    fileSize: 5 * 1024 * 1024,
   },
   fileFilter: fileFilter,
 });
